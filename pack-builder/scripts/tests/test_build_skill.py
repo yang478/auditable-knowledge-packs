@@ -1,0 +1,1304 @@
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+import zipfile
+import sqlite3
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[3]  # repo root
+BUILDER = ROOT / "pack-builder" / "scripts" / "build_skill.py"
+FIXTURE_ROOT = ROOT / "pack-builder" / "scripts" / "tests" / "fixtures" / "retrieval"
+
+
+def fixture_text(name: str) -> str:
+    return (FIXTURE_ROOT / name).read_text(encoding="utf-8")
+
+
+def write_fixture(tmp_path: Path, name: str) -> Path:
+    target = tmp_path / name
+    target.write_text(fixture_text(name), encoding="utf-8")
+    return target
+
+
+def build_retrieval_skill(tmp_path: Path, *fixture_names: str) -> Path:
+    input_paths = [write_fixture(tmp_path, name) for name in fixture_names]
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    subprocess.run(
+        [
+            "python3",
+            str(BUILDER),
+            "--skill-name",
+            "my-books",
+            "--out-dir",
+            str(out_dir),
+            "--inputs",
+            *[str(path) for path in input_paths],
+            "--title",
+            "Controlled Retrieval KB",
+        ],
+        check=True,
+        env={**os.environ, "PYTHONUTF8": "1"},
+        cwd=str(ROOT),
+    )
+    return out_dir / "my-books"
+
+
+def table_columns(db_path: Path, table_name: str) -> set[str]:
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    finally:
+        conn.close()
+    return {str(row[1]) for row in rows}
+
+
+def run_bundle(generated: Path, *, query: str, extra_args: list[str] | None = None) -> str:
+    bundle_path = generated / "bundle.md"
+    args = [
+        "python3",
+        str(generated / "scripts" / "kbtool.py"),
+        "bundle",
+        "--query",
+        query,
+        "--out",
+        str(bundle_path),
+    ]
+    if extra_args:
+        args.extend(extra_args)
+    subprocess.run(
+        args,
+        check=True,
+        env={**os.environ, "PYTHONUTF8": "1"},
+        cwd=str(generated),
+    )
+    return bundle_path.read_text(encoding="utf-8")
+
+
+def run_search(generated: Path, *, query: str, extra_args: list[str] | None = None) -> str:
+    search_path = generated / "search.md"
+    args = [
+        "python3",
+        str(generated / "scripts" / "kbtool.py"),
+        "search",
+        "--query",
+        query,
+        "--out",
+        str(search_path),
+    ]
+    if extra_args:
+        args.extend(extra_args)
+    subprocess.run(
+        args,
+        check=True,
+        env={**os.environ, "PYTHONUTF8": "1"},
+        cwd=str(generated),
+    )
+    return search_path.read_text(encoding="utf-8")
+
+
+def switch_standard_metadata(generated: Path, fixture_name: str) -> None:
+    title = fixture_text(fixture_name).splitlines()[0].removeprefix("# ").strip()
+    metadata_path = generated / "references" / "standard-v1" / "metadata.md"
+    metadata_path.write_text(
+        f"# {title}\n\n- 源文件：`standard_v1.md`\n",
+        encoding="utf-8",
+    )
+
+
+def run_reindex(generated: Path) -> str:
+    proc = subprocess.run(
+        ["python3", str(generated / "scripts" / "kbtool.py"), "reindex"],
+        check=True,
+        env={**os.environ, "PYTHONUTF8": "1"},
+        cwd=str(generated),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return proc.stdout
+
+
+def active_doc_title(db_path: Path, *, doc_id: str = "standard-v1") -> str:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT doc_title FROM docs WHERE doc_id = ? AND is_active = 1 ORDER BY source_version DESC LIMIT 1",
+            (doc_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return str(row[0]) if row else ""
+
+
+def inactive_doc_titles(db_path: Path, *, doc_id: str = "standard-v1") -> list[str]:
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT doc_title FROM docs WHERE doc_id = ? AND is_active = 0 ORDER BY source_version",
+            (doc_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(row[0]) for row in rows]
+
+
+def add_aliases_to_article(article_path: Path, aliases: list[str]) -> None:
+    text = article_path.read_text(encoding="utf-8")
+    marker = "---\n\n"
+    if marker not in text:
+        raise AssertionError(f"Missing frontmatter terminator in {article_path}")
+    frontmatter, body = text.split(marker, 1)
+    updated = frontmatter + f'aliases: {json.dumps(aliases, ensure_ascii=False)}\n' + marker + body
+    article_path.write_text(updated, encoding="utf-8")
+
+
+class BuildSkillTests(unittest.TestCase):
+    def test_manifest_includes_active_version_and_doc_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+            manifest = json.loads((generated / "manifest.json").read_text(encoding="utf-8"))
+            doc = manifest["docs"][0]
+            self.assertEqual(doc["doc_id"], "standard-v1")
+            self.assertTrue(doc["active_version"])
+            self.assertTrue(doc["doc_hash"])
+
+    def test_kb_sqlite_contains_node_hash_and_raw_span_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+            conn = sqlite3.connect(generated / "kb.sqlite")
+            try:
+                row = conn.execute("SELECT node_hash, raw_span_start, raw_span_end FROM nodes LIMIT 1").fetchone()
+            finally:
+                conn.close()
+
+            self.assertTrue(row[0])
+            self.assertGreaterEqual(row[1], 0)
+            self.assertGreater(row[2], row[1])
+
+    def test_nodes_table_has_v1_metadata_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+            cols = table_columns(generated / "kb.sqlite", "nodes")
+
+            self.assertIn("node_hash", cols)
+            self.assertIn("raw_span_start", cols)
+            self.assertIn("raw_span_end", cols)
+            self.assertIn("confidence", cols)
+
+    def test_docs_table_has_version_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+            cols = table_columns(generated / "kb.sqlite", "docs")
+
+            self.assertIn("doc_hash", cols)
+            self.assertIn("source_version", cols)
+            self.assertIn("is_active", cols)
+
+    def test_rebuild_keeps_old_version_until_atomic_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+            switch_standard_metadata(generated, "standard_v2.md")
+            run_reindex(generated)
+
+            self.assertEqual(active_doc_title(generated / "kb.sqlite"), "标准文本 V2")
+            self.assertIn("标准文本 V1", inactive_doc_titles(generated / "kb.sqlite"))
+
+    def test_build_creates_references_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+            conn = sqlite3.connect(generated / "kb.sqlite")
+            try:
+                rows = conn.execute(
+                    "SELECT edge_type, from_node_id, to_node_id FROM edges WHERE edge_type='references'"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertGreaterEqual(len(rows), 1)
+
+    def test_bundle_can_include_referenced_article_when_triggered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            bundle = run_bundle(generated, query="适用范围", extra_args=["--debug-triggers"])
+            self.assertIn("补查触发", bundle)
+            self.assertIn("references/", bundle)
+
+    def test_exact_alias_matches_without_body_token_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            bundle = run_bundle(generated, query="质保期")
+            self.assertIn("质量保证期限", bundle)
+
+    def test_soft_alias_requires_supporting_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            search = run_search(generated, query="上线")
+            self.assertNotIn("仅软别名命中的噪声节点", search)
+
+    def test_query_normalization_handles_chinese_numerals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            bundle = run_bundle(generated, query="第三条的适用范围")
+            self.assertIn("`standard-v1:article:003`", bundle)
+
+    def test_title_hits_rank_above_body_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            search = run_search(generated, query="适用范围")
+            self.assertLess(search.index("article:003"), search.index("block:0004"))
+
+    def test_triggered_expansion_adds_definition_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            bundle = run_bundle(generated, query="定义是什么")
+            self.assertIn("## 补查记录", bundle)
+            self.assertIn("definition", bundle)
+
+    def test_triggered_expansion_runs_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            bundle = run_bundle(generated, query="适用范围和例外")
+            self.assertEqual(bundle.count("## 补查记录"), 1)
+
+    def test_reindex_rebuilds_shadow_db_before_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            switch_standard_metadata(generated, "standard_v2.md")
+            stdout = run_reindex(generated)
+            self.assertIn("shadow rebuild", stdout)
+            self.assertIn("atomic switch", stdout)
+
+    def test_only_one_doc_version_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            switch_standard_metadata(generated, "standard_v2.md")
+            run_reindex(generated)
+
+            conn = sqlite3.connect(generated / "kb.sqlite")
+            try:
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM docs WHERE doc_id = ? AND is_active = 1",
+                    ("standard-v1",),
+                ).fetchone()[0]
+                versions = conn.execute(
+                    "SELECT COUNT(*) FROM docs WHERE doc_id = ?",
+                    ("standard-v1",),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(active, 1)
+            self.assertEqual(versions, 2)
+
+    def test_reindex_keeps_inactive_nodes_edges_and_aliases_for_old_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            add_aliases_to_article(
+                generated / "references" / "standard-v1" / "articles" / "article-0002.md",
+                ["保修期"],
+            )
+            run_reindex(generated)
+            switch_standard_metadata(generated, "standard_v2.md")
+            run_reindex(generated)
+
+            conn = sqlite3.connect(generated / "kb.sqlite")
+            try:
+                inactive_nodes = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE doc_id = ? AND source_version = ? AND is_active = 0",
+                    ("standard-v1", "v1"),
+                ).fetchone()[0]
+                inactive_edges = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE source_version = ? AND is_active = 0",
+                    ("v1",),
+                ).fetchone()[0]
+                inactive_aliases = conn.execute(
+                    "SELECT COUNT(*) FROM aliases WHERE normalized_alias = ? AND source_version = ? AND is_active = 0",
+                    ("保修期", "v1"),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertGreater(inactive_nodes, 0)
+            self.assertGreater(inactive_edges, 0)
+            self.assertGreater(inactive_aliases, 0)
+
+    def test_force_rebuild_preserves_previous_doc_graph_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            standard_v1 = write_fixture(tmp_path, "standard_v1.md")
+            handbook = write_fixture(tmp_path, "handbook.md")
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    "my-books",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(standard_v1),
+                    str(handbook),
+                    "--title",
+                    "Controlled Retrieval KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / "my-books"
+            standard_v1.write_text(fixture_text("standard_v2.md"), encoding="utf-8")
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    "my-books",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(standard_v1),
+                    str(handbook),
+                    "--title",
+                    "Controlled Retrieval KB",
+                    "--force",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            self.assertEqual(active_doc_title(generated / "kb.sqlite"), "标准文本 V2")
+            self.assertIn("标准文本 V1", inactive_doc_titles(generated / "kb.sqlite"))
+
+            conn = sqlite3.connect(generated / "kb.sqlite")
+            try:
+                inactive_nodes = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE doc_id = ? AND source_version = ? AND is_active = 0",
+                    ("standard-v1", "v1"),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertGreater(inactive_nodes, 0)
+
+    def test_curated_reference_alias_can_extend_recall_without_soft_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            add_aliases_to_article(
+                generated / "references" / "standard-v1" / "articles" / "article-0002.md",
+                ["保修期"],
+            )
+            run_reindex(generated)
+
+            bundle = run_bundle(generated, query="保修期")
+            self.assertIn("质量保证期限", bundle)
+
+    def test_generated_skill_mentions_triggered_expansion_and_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            skill_md = (generated / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("标题/正文/术语 三路召回", skill_md)
+            self.assertIn("一轮补查", skill_md)
+            self.assertIn("原子重建", skill_md)
+
+    def test_build_skill_creates_kb_skill_from_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "book.md"
+            input_md.write_text(
+                "# Chapter 1 Intro\n\nHello.\n\n## 1.1 Scope\n\nDetails.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            self.assertTrue((generated / "SKILL.md").exists())
+            self.assertTrue((generated / "manifest.json").exists())
+            refs_root = generated / "references"
+            doc_dirs = [p for p in refs_root.iterdir() if p.is_dir()]
+            self.assertEqual(len(doc_dirs), 1)
+            self.assertTrue((doc_dirs[0] / "toc.md").exists())
+            self.assertTrue((generated / "indexes" / "headings" / "_shards.tsv").exists())
+            self.assertTrue((generated / "indexes" / "kw" / "_shards.tsv").exists())
+
+    def test_build_skill_outputs_sqlite_and_kbtool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "book.md"
+            input_md.write_text(
+                "# Chapter 1 Intro\n\nHello.\n\n## 1.1 Scope\n\nDetails.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            self.assertTrue((generated / "kb.sqlite").exists())
+            self.assertTrue((generated / "scripts" / "kbtool.py").exists())
+
+    def test_kbtool_bundle_produces_bundle_with_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "book.md"
+            input_md.write_text(
+                "# Chapter 1 Intro\n\nHello.\n\n## 1.1 Scope\n\nDetails.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            bundle_path = generated / "bundle.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "Scope",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn("## 参考依据", bundle)
+            self.assertIn("references/", bundle)
+
+    def test_bundle_limit_orders_by_bm25_best_match_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "plain.md"
+            input_md.write_text(
+                "Paragraph one foo.\n\n"
+                "Paragraph two foo foo foo foo foo.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            bundle_path = generated / "bundle.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "foo",
+                    "--limit",
+                    "1",
+                    "--neighbors",
+                    "0",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn("`plain:block:0002`", bundle)
+            self.assertNotIn("`plain:block:0001`", bundle)
+
+    def test_bundle_long_repetitive_query_still_matches_rare_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "plain.md"
+            unique = "UNIQUE_TOKEN_123"
+            input_md.write_text(
+                f"Only this paragraph contains {unique}.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            bundle_path = generated / "bundle.md"
+            long_query = ("foo " * 70 + unique).strip()
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    long_query,
+                    "--neighbors",
+                    "0",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn(unique, bundle)
+
+    def test_bundle_order_chronological_outputs_in_document_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "plain.md"
+            input_md.write_text(
+                "Paragraph one foo.\n\n"
+                "Paragraph two foo foo foo foo foo.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            bundle_path = generated / "bundle.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "foo",
+                    "--limit",
+                    "2",
+                    "--neighbors",
+                    "0",
+                    "--order",
+                    "chronological",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertLess(bundle.index("`plain:block:0001`"), bundle.index("`plain:block:0002`"))
+
+    def test_bundle_query_mode_and_requires_all_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "plain.md"
+            input_md.write_text(
+                "Paragraph one foo.\n\n"
+                "Paragraph two bar.\n\n"
+                "Paragraph three foo bar.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            bundle_path = generated / "bundle.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "foo bar",
+                    "--query-mode",
+                    "and",
+                    "--neighbors",
+                    "0",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn("`plain:block:0003`", bundle)
+            self.assertNotIn("`plain:block:0001`", bundle)
+            self.assertNotIn("`plain:block:0002`", bundle)
+
+    def test_bundle_must_terms_filter_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "plain.md"
+            input_md.write_text(
+                "Paragraph one foo.\n\n"
+                "Paragraph two foo.\n\n"
+                "Paragraph three foo bar.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            bundle_path = generated / "bundle.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "foo",
+                    "--must",
+                    "bar",
+                    "--neighbors",
+                    "0",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn("`plain:block:0003`", bundle)
+            self.assertNotIn("`plain:block:0001`", bundle)
+            self.assertNotIn("`plain:block:0002`", bundle)
+
+    def test_kbtool_search_writes_markdown_with_snippets_and_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "plain.md"
+            input_md.write_text(
+                "Paragraph one foo.\n\n"
+                "Paragraph two bar.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            search_path = generated / "search.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "search",
+                    "--query",
+                    "foo",
+                    "--out",
+                    str(search_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+            search_md = search_path.read_text(encoding="utf-8")
+            self.assertIn("references/", search_md)
+            self.assertIn("`plain:block:0001`", search_md)
+            self.assertIn("foo", search_md)
+
+    def test_kbtool_reindex_updates_search_after_reference_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "GB-TEST-003.md"
+            input_md.write_text(
+                "# 总则\n\n"
+                "第1条 目的\n"
+                "（一）适用范围A。\n"
+                "（二）适用范围B。\n\n"
+                "第2条 定义\n"
+                "（一）术语A。\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            refs_root = generated / "references"
+            doc_dirs = [p for p in refs_root.iterdir() if p.is_dir()]
+            self.assertEqual(len(doc_dirs), 1)
+            doc_dir = doc_dirs[0]
+            articles = sorted((doc_dir / "articles").glob("article-*.md"))
+            self.assertGreaterEqual(len(articles), 1)
+
+            unique = "UNIQUE_TOKEN_123"
+            articles[0].write_text(articles[0].read_text(encoding="utf-8") + f"\n\n{unique}\n", encoding="utf-8")
+
+            bundle_path = generated / "bundle.md"
+            proc_before = subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    unique,
+                    "--out",
+                    str(bundle_path),
+                ],
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertNotEqual(proc_before.returncode, 0)
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "reindex",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    unique,
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn(unique, bundle)
+
+    def test_chinese_articles_and_items_index_and_bundle_elevates_to_article(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "GB-TEST-001.md"
+            input_md.write_text(
+                "# 总则\n\n"
+                "第1条 目的\n"
+                "（一）适用范围A。\n"
+                "（二）适用范围B。\n\n"
+                "第2条 定义\n"
+                "（一）术语A。\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            refs_root = generated / "references"
+            doc_dirs = [p for p in refs_root.iterdir() if p.is_dir()]
+            self.assertEqual(len(doc_dirs), 1)
+            doc_dir = doc_dirs[0]
+            self.assertTrue((doc_dir / "articles").exists())
+            self.assertTrue((doc_dir / "items").exists())
+
+            conn = sqlite3.connect(str(generated / "kb.sqlite"))
+            try:
+                article_count = conn.execute("SELECT COUNT(*) FROM nodes WHERE kind='article'").fetchone()[0]
+                item_count = conn.execute("SELECT COUNT(*) FROM nodes WHERE kind='item'").fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertGreaterEqual(article_count, 2)
+            self.assertGreaterEqual(item_count, 3)
+
+            bundle_path = generated / "bundle.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "术语A",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn("## 参考依据", bundle)
+            self.assertIn("/articles/", bundle)
+            self.assertNotIn("/items/", bundle)
+
+    def test_markdown_heading_articles_are_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "GB-TEST-002.md"
+            input_md.write_text(
+                "# 总则\n\n"
+                "#### 第1条 目的\n"
+                "（一）适用范围A。\n"
+                "（二）适用范围B。\n\n"
+                "#### 第2条 定义\n"
+                "（一）术语A。\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            refs_root = generated / "references"
+            doc_dirs = [p for p in refs_root.iterdir() if p.is_dir()]
+            self.assertEqual(len(doc_dirs), 1)
+            doc_dir = doc_dirs[0]
+            self.assertTrue((doc_dir / "articles").exists())
+
+            conn = sqlite3.connect(str(generated / "kb.sqlite"))
+            try:
+                article_count = conn.execute("SELECT COUNT(*) FROM nodes WHERE kind='article'").fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertGreaterEqual(article_count, 2)
+
+            bundle_path = generated / "bundle.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "术语A",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn("/articles/", bundle)
+
+    def test_no_headings_generates_blocks_and_bundle_uses_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "plain.md"
+            input_md.write_text(
+                "Paragraph one about Alpha.\n\n"
+                "Paragraph two about Beta.\n\n"
+                "Paragraph three about Gamma.\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            refs_root = generated / "references"
+            doc_dirs = [p for p in refs_root.iterdir() if p.is_dir()]
+            self.assertEqual(len(doc_dirs), 1)
+            doc_dir = doc_dirs[0]
+            self.assertTrue((doc_dir / "blocks").exists())
+            block_files = sorted((doc_dir / "blocks").glob("*.md"))
+            self.assertGreaterEqual(len(block_files), 2)
+
+            bundle_path = generated / "bundle.md"
+            subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "Beta",
+                    "--out",
+                    str(bundle_path),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+            )
+
+            bundle = bundle_path.read_text(encoding="utf-8")
+            self.assertIn("/blocks/", bundle)
+
+    def test_invalid_docx_fails_with_actionable_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bad_docx = tmp_path / "bad.docx"
+            with zipfile.ZipFile(bad_docx, "w") as zf:
+                zf.writestr("word/document.xml", b"<w:document>")  # malformed
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+
+            proc = subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    "bad-docx-kb",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(bad_docx),
+                ],
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("DOCX", proc.stderr.upper())
+            self.assertTrue(("DOCX →" in proc.stderr) or ("converting DOCX" in proc.stderr))
+
+    def test_pdf_without_pdftotext_instructs_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dummy_pdf = tmp_path / "a.pdf"
+            dummy_pdf.write_bytes(b"%PDF-1.4\n% dummy\n")
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+
+            proc = subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    "pdf-kb",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(dummy_pdf),
+                ],
+                env={**os.environ, "PYTHONUTF8": "1", "BOOK_SKILL_GENERATOR_NO_PDFTOTEXT": "1"},
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("pdftotext", proc.stderr)
+
+    def test_doc_id_derives_from_standardized_filename_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = tmp_path / "国标GB／T1234－2020 信息安全技术.md"
+            input_md.write_text("# 标题\n\n内容。\n", encoding="utf-8")
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            skill_name = "my-books"
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    skill_name,
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "My Books KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            generated = out_dir / skill_name
+            refs_root = generated / "references"
+            doc_dirs = [p for p in refs_root.iterdir() if p.is_dir()]
+            self.assertEqual(len(doc_dirs), 1)
+            self.assertEqual(doc_dirs[0].name, "gb-t-1234-2020")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,34 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Test/coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type check / lint caches
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tool outputs (generated skills, etc.)
+.claude/
+.worktrees/
+
+# Private / non-OSS docs
+docs/plan/
+docs/plans/
+SECURITY.md
