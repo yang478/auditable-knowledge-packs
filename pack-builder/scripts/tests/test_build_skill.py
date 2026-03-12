@@ -1,10 +1,12 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
 import sqlite3
+import platform
 from pathlib import Path
 
 
@@ -45,6 +47,74 @@ def build_retrieval_skill(tmp_path: Path, *fixture_names: str) -> Path:
         cwd=str(ROOT),
     )
     return out_dir / "my-books"
+
+def build_skill_from_paths(
+    tmp_path: Path,
+    input_paths: list[Path],
+    *,
+    skill_name: str = "my-books",
+    title: str = "Controlled Retrieval KB",
+    extra_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> Path:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    if extra_env:
+        env.update(extra_env)
+    subprocess.run(
+        [
+            "python3",
+            str(BUILDER),
+            "--skill-name",
+            skill_name,
+            "--out-dir",
+            str(out_dir),
+            "--inputs",
+            *[str(path) for path in input_paths],
+            "--title",
+            title,
+            *(extra_args or []),
+        ],
+        check=True,
+        env=env,
+        cwd=str(ROOT),
+    )
+    return out_dir / skill_name
+
+
+def build_skill_from_ir_jsonl(
+    tmp_path: Path,
+    *,
+    lines: list[dict],
+    skill_name: str = "my-books",
+    title: str = "IR Knowledge Base",
+) -> Path:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    ir_path = tmp_path / "ir.jsonl"
+    ir_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in lines) + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "python3",
+            str(BUILDER),
+            "--skill-name",
+            skill_name,
+            "--out-dir",
+            str(out_dir),
+            "--ir-jsonl",
+            str(ir_path),
+            "--title",
+            title,
+        ],
+        check=True,
+        env={**os.environ, "PYTHONUTF8": "1"},
+        cwd=str(ROOT),
+    )
+    return out_dir / skill_name
 
 
 def table_columns(db_path: Path, table_name: str) -> set[str]:
@@ -145,6 +215,54 @@ def inactive_doc_titles(db_path: Path, *, doc_id: str = "standard-v1") -> list[s
         conn.close()
     return [str(row[0]) for row in rows]
 
+def run_categories(generated: Path) -> str:
+    out_path = generated / "categories.md"
+    subprocess.run(
+        ["python3", str(generated / "scripts" / "kbtool.py"), "categories", "--out", str(out_path)],
+        check=True,
+        env={**os.environ, "PYTHONUTF8": "1"},
+        cwd=str(generated),
+    )
+    return out_path.read_text(encoding="utf-8")
+
+
+def run_docs(generated: Path, *, category: str) -> str:
+    out_path = generated / "docs.md"
+    subprocess.run(
+        [
+            "python3",
+            str(generated / "scripts" / "kbtool.py"),
+            "docs",
+            "--category",
+            category,
+            "--out",
+            str(out_path),
+        ],
+        check=True,
+        env={**os.environ, "PYTHONUTF8": "1"},
+        cwd=str(generated),
+    )
+    return out_path.read_text(encoding="utf-8")
+
+
+def run_kbtool_json(generated: Path, argv: list[str], *, cwd: Path | None = None) -> object:
+    proc = subprocess.run(
+        ["python3", str(generated / "scripts" / "kbtool.py"), *argv],
+        check=True,
+        env={**os.environ, "PYTHONUTF8": "1"},
+        cwd=str(cwd or generated),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    out = proc.stdout.strip()
+    if not out:
+        raise AssertionError(f"kbtool produced no stdout. stderr:\n{proc.stderr}")
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"kbtool stdout is not valid JSON: {e}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}") from e
+
 
 def add_aliases_to_article(article_path: Path, aliases: list[str]) -> None:
     text = article_path.read_text(encoding="utf-8")
@@ -157,6 +275,368 @@ def add_aliases_to_article(article_path: Path, aliases: list[str]) -> None:
 
 
 class BuildSkillTests(unittest.TestCase):
+    def test_build_skill_from_ir_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_skill_from_ir_jsonl(
+                tmp_path,
+                lines=[
+                    {
+                        "type": "doc",
+                        "doc_id": "standard-v1",
+                        "title": "标准文本 V1",
+                        "source_file": "standard_v1.md",
+                        "source_version": "v1",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "standard-v1",
+                        "node_id": "standard-v1:article:0003",
+                        "kind": "article",
+                        "label": "第3条",
+                        "title": "第3条 适用范围",
+                        "ordinal": 3,
+                        "body_md": "第3条 适用范围：这里是适用范围的正文。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "standard-v1",
+                        "node_id": "standard-v1:block:0004",
+                        "kind": "block",
+                        "label": "block-0004",
+                        "title": "仅正文命中块",
+                        "ordinal": 4,
+                        "body_md": "这里也提到了适用范围，但标题不包含关键字。\n",
+                    },
+                ],
+            )
+            self.assertTrue((generated / "kb.sqlite").exists())
+            search = run_search(generated, query="适用范围")
+            self.assertLess(search.index("article:003"), search.index("block:0004"))
+
+    def test_build_generates_catalog_by_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            a = tmp_path / "infectious_a.md"
+            b = tmp_path / "infectious_b.md"
+            c = tmp_path / "cardio_c.md"
+            a.write_text("# Infectious Disease - Alpha\n\nA.\n", encoding="utf-8")
+            b.write_text("# Infectious Disease - Beta\n\nB.\n", encoding="utf-8")
+            c.write_text("# Cardiology - Gamma\n\nC.\n", encoding="utf-8")
+
+            generated = build_skill_from_paths(tmp_path, [a, b, c])
+            cats = generated / "catalog" / "categories.md"
+            self.assertTrue(cats.exists())
+            self.assertTrue((generated / "catalog" / "categories" / "infectious-disease.md").exists())
+            self.assertTrue((generated / "catalog" / "categories" / "cardiology.md").exists())
+
+            cats_md = cats.read_text(encoding="utf-8")
+            self.assertIn("Infectious Disease", cats_md)
+            self.assertIn("Cardiology", cats_md)
+
+            infectious_md = (generated / "catalog" / "categories" / "infectious-disease.md").read_text(encoding="utf-8")
+            self.assertIn("infectious-a", infectious_md)
+            self.assertIn("infectious-b", infectious_md)
+
+    def test_skill_md_omits_full_doc_list_when_over_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            inputs: list[Path] = []
+            for i in range(6):
+                p = tmp_path / f"bulk_{i}.md"
+                p.write_text(f"# BulkCat - Doc{i}\n\nBody {i}.\n", encoding="utf-8")
+                inputs.append(p)
+
+            generated = build_skill_from_paths(
+                tmp_path,
+                inputs,
+                extra_env={"PACK_BUILDER_SKILL_MD_DOCS_LIMIT": "2"},
+            )
+            skill_md = (generated / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("catalog/categories.md", skill_md)
+            self.assertNotIn("bulk-5", skill_md)
+
+    def test_kbtool_can_list_categories_and_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            a = tmp_path / "infectious_a.md"
+            b = tmp_path / "infectious_b.md"
+            c = tmp_path / "cardio_c.md"
+            a.write_text("# Infectious Disease - Alpha\n\nA.\n", encoding="utf-8")
+            b.write_text("# Infectious Disease - Beta\n\nB.\n", encoding="utf-8")
+            c.write_text("# Cardiology - Gamma\n\nC.\n", encoding="utf-8")
+
+            generated = build_skill_from_paths(tmp_path, [a, b, c])
+            cats = run_categories(generated)
+            self.assertIn("Infectious Disease", cats)
+            self.assertIn("Cardiology", cats)
+
+            docs = run_docs(generated, category="Infectious Disease")
+            self.assertIn("infectious-a", docs)
+            self.assertIn("infectious-b", docs)
+            self.assertNotIn("cardio-c", docs)
+
+    def test_build_catalog_can_use_external_assignments(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            a = tmp_path / "a.md"
+            b = tmp_path / "b.md"
+            a.write_text("# Totally Random Title\n\nA.\n", encoding="utf-8")
+            b.write_text("# Another Random Title\n\nB.\n", encoding="utf-8")
+
+            def sha1(text: str) -> str:
+                return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+            taxonomy_path = tmp_path / "taxonomy.json"
+            taxonomy_path.write_text(
+                json.dumps(
+                    {
+                        "name": "domain-taxonomy",
+                        "version": "v1",
+                        "categories": [
+                            {"id": "medical", "label": "医疗健康"},
+                            {"id": "engineering", "label": "工程与计算"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            assignments_path = tmp_path / "assignments.jsonl"
+            assignments = [
+                {"doc_hash": sha1(a.read_text(encoding="utf-8")), "primary_category_id": "engineering"},
+                {"doc_hash": sha1(b.read_text(encoding="utf-8")), "primary_category_id": "medical"},
+            ]
+            assignments_path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False) for row in assignments) + "\n",
+                encoding="utf-8",
+            )
+
+            generated = build_skill_from_paths(
+                tmp_path,
+                [a, b],
+                extra_args=[
+                    "--catalog-taxonomy",
+                    str(taxonomy_path),
+                    "--catalog-assignments",
+                    str(assignments_path),
+                ],
+                extra_env={"PACK_BUILDER_SKILL_MD_DOCS_LIMIT": "0"},
+            )
+
+            cats_md = (generated / "catalog" / "categories.md").read_text(encoding="utf-8")
+            self.assertIn("医疗健康", cats_md)
+            self.assertIn("工程与计算", cats_md)
+            self.assertNotIn("未分类", cats_md)
+            self.assertTrue((generated / "catalog" / "categories" / "医疗健康.md").exists())
+            self.assertTrue((generated / "catalog" / "categories" / "工程与计算.md").exists())
+
+            skill_md = (generated / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("医疗健康", skill_md)
+            self.assertIn("工程与计算", skill_md)
+            self.assertNotIn("未分类", skill_md)
+
+    def test_build_fails_on_unknown_assignment_category_id(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            a = tmp_path / "a.md"
+            a.write_text("# Totally Random Title\n\nA.\n", encoding="utf-8")
+
+            def sha1(text: str) -> str:
+                return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+            taxonomy_path = tmp_path / "taxonomy.json"
+            taxonomy_path.write_text(
+                json.dumps(
+                    {
+                        "name": "domain-taxonomy",
+                        "version": "v1",
+                        "categories": [
+                            {"id": "medical", "label": "医疗健康"},
+                            {"id": "engineering", "label": "工程与计算"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            assignments_path = tmp_path / "assignments.jsonl"
+            assignments_path.write_text(
+                json.dumps({"doc_hash": sha1(a.read_text(encoding="utf-8")), "primary_category_id": "not-in-taxonomy"}, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            proc = subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    "my-books",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(a),
+                    "--title",
+                    "Controlled Retrieval KB",
+                    "--catalog-taxonomy",
+                    str(taxonomy_path),
+                    "--catalog-assignments",
+                    str(assignments_path),
+                ],
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("not-in-taxonomy", proc.stdout)
+
+    def test_build_fails_on_duplicate_doc_hash_in_assignments(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            a = tmp_path / "a.md"
+            a.write_text("# Totally Random Title\n\nA.\n", encoding="utf-8")
+
+            def sha1(text: str) -> str:
+                return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+            taxonomy_path = tmp_path / "taxonomy.json"
+            taxonomy_path.write_text(
+                json.dumps(
+                    {
+                        "name": "domain-taxonomy",
+                        "version": "v1",
+                        "categories": [
+                            {"id": "medical", "label": "医疗健康"},
+                            {"id": "engineering", "label": "工程与计算"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            assignments_path = tmp_path / "assignments.jsonl"
+            h = sha1(a.read_text(encoding="utf-8"))
+            assignments_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"doc_hash": h, "primary_category_id": "medical"}, ensure_ascii=False),
+                        json.dumps({"doc_hash": h, "primary_category_id": "engineering"}, ensure_ascii=False),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            proc = subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    "my-books",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(a),
+                    "--title",
+                    "Controlled Retrieval KB",
+                    "--catalog-taxonomy",
+                    str(taxonomy_path),
+                    "--catalog-assignments",
+                    str(assignments_path),
+                ],
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("duplicate", proc.stdout.lower())
+
+    def test_kbtool_categories_and_docs_prefer_assignments_when_present(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            a = tmp_path / "a.md"
+            b = tmp_path / "b.md"
+            a.write_text("# Totally Random Title\n\nA.\n", encoding="utf-8")
+            b.write_text("# Another Random Title\n\nB.\n", encoding="utf-8")
+
+            def sha1(text: str) -> str:
+                return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+            taxonomy_path = tmp_path / "taxonomy.json"
+            taxonomy_path.write_text(
+                json.dumps(
+                    {
+                        "name": "domain-taxonomy",
+                        "version": "v1",
+                        "categories": [
+                            {"id": "medical", "label": "医疗健康"},
+                            {"id": "engineering", "label": "工程与计算"},
+                            {"id": "other", "label": "综合/其他"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            assignments_path = tmp_path / "assignments.jsonl"
+            assignments = [
+                {"doc_hash": sha1(a.read_text(encoding="utf-8")), "primary_category_id": "engineering"},
+                {"doc_hash": sha1(b.read_text(encoding="utf-8")), "primary_category_id": "medical"},
+            ]
+            assignments_path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False) for row in assignments) + "\n",
+                encoding="utf-8",
+            )
+
+            generated = build_skill_from_paths(
+                tmp_path,
+                [a, b],
+                extra_args=[
+                    "--catalog-taxonomy",
+                    str(taxonomy_path),
+                    "--catalog-assignments",
+                    str(assignments_path),
+                ],
+            )
+
+            cats = run_categories(generated)
+            self.assertIn("医疗健康", cats)
+            self.assertIn("工程与计算", cats)
+            self.assertNotIn("未分类", cats)
+
+            docs = run_docs(generated, category="医疗健康")
+            self.assertIn("`b`", docs)
+            self.assertNotIn("`a`", docs)
+
     def test_manifest_includes_active_version_and_doc_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -266,6 +746,115 @@ class BuildSkillTests(unittest.TestCase):
 
             search = run_search(generated, query="适用范围")
             self.assertLess(search.index("article:003"), search.index("block:0004"))
+
+    def test_kbtool_hooks_can_filter_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            hooks_dir = generated / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / "post_search.py").write_text(
+                "\n".join(
+                    [
+                        "def run(payload):",
+                        "    hits = payload.get('hits') or []",
+                        "    hits = [h for h in hits if ':block:' not in h]",
+                        "    return {'hits': hits}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            baseline = run_search(generated, query="适用范围")
+            self.assertIn("block:0004", baseline)
+
+            filtered = run_search(generated, query="适用范围", extra_args=["--enable-hooks"])
+            self.assertNotIn("block:0004", filtered)
+
+    def test_kbtool_pre_search_hook_can_rewrite_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            hooks_dir = generated / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / "pre_search.py").write_text(
+                "\n".join(
+                    [
+                        "def run(payload):",
+                        "    q = str(payload.get('query') or '')",
+                        "    if q == '保修期':",
+                        "        return {'query': '质保期'}",
+                        "    return {}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(subprocess.CalledProcessError):
+                run_search(generated, query="保修期")
+
+            rewritten = run_search(generated, query="保修期", extra_args=["--enable-hooks"])
+            self.assertIn("质量保证期限", rewritten)
+
+    def test_kbtool_pre_expand_hook_can_add_node_to_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            hooks_dir = generated / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / "pre_expand.py").write_text(
+                "\n".join(
+                    [
+                        "def run(payload):",
+                        "    hits = payload.get('hits') or []",
+                        "    hits = list(hits)",
+                        "    hits.append('standard-v1:article:0004')",
+                        "    return {'hits': hits}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            baseline = run_bundle(generated, query="质量保证期限")
+            self.assertNotIn("article:004", baseline)
+
+            expanded = run_bundle(generated, query="质量保证期限", extra_args=["--enable-hooks"])
+            self.assertIn("article:004", expanded)
+
+    def test_kbtool_pre_render_hook_can_redact_bundle_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            hooks_dir = generated / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / "pre_render.py").write_text(
+                "\n".join(
+                    [
+                        "def run(payload):",
+                        "    node = payload.get('node') or {}",
+                        "    node_id = str(node.get('node_id') or '')",
+                        "    if node_id.endswith('standard-v1:article:0002'):",
+                        "        return {'body_md': 'REDACTED\\n'}",
+                        "    return {}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            baseline = run_bundle(generated, query="质量保证期限")
+            self.assertNotIn("REDACTED", baseline)
+
+            redacted = run_bundle(generated, query="质量保证期限", extra_args=["--enable-hooks"])
+            self.assertIn("REDACTED", redacted)
+            self.assertIn("hook: pre_render", redacted)
 
     def test_triggered_expansion_adds_definition_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -437,6 +1026,18 @@ class BuildSkillTests(unittest.TestCase):
             self.assertIn("标题/正文/术语 三路召回", skill_md)
             self.assertIn("一轮补查", skill_md)
             self.assertIn("原子重建", skill_md)
+
+    def test_generated_skill_includes_llm_tldr_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            skill_md = (generated / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("TL;DR (LLM/Agent)", skill_md)
+            self.assertIn("./kbtool --skill", skill_md)
+            self.assertIn("./kbtool bundle --query", skill_md)
+            self.assertIn("## 参考依据", skill_md)
+            self.assertIn("不要直接调用 `scripts/` 或 `bin/`", skill_md)
 
     def test_build_skill_creates_kb_skill_from_md(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -734,6 +1335,85 @@ class BuildSkillTests(unittest.TestCase):
 
             bundle = bundle_path.read_text(encoding="utf-8")
             self.assertLess(bundle.index("`plain:block:0001`"), bundle.index("`plain:block:0002`"))
+
+    def test_bundle_reference_citations_include_node_id_and_source_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_skill_from_ir_jsonl(
+                tmp_path,
+                lines=[
+                    {
+                        "type": "doc",
+                        "doc_id": "standard-v1",
+                        "title": "标准文本 V1",
+                        "source_file": "GB-TEST-002.md",
+                        "source_path": "books/GB-TEST-002.md",
+                        "source_version": "v1",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "standard-v1",
+                        "node_id": "standard-v1:article:0003",
+                        "kind": "article",
+                        "label": "第3条",
+                        "title": "第3条 适用范围",
+                        "ordinal": 3,
+                        "body_md": "第3条 适用范围：这里是适用范围的正文。\n",
+                    },
+                ],
+            )
+
+            bundle = run_bundle(generated, query="适用范围")
+            ref_section = bundle.split("## 参考依据\n", 1)[1]
+            self.assertIn("standard-v1:article:003", ref_section)
+            self.assertIn("books/GB-TEST-002.md", ref_section)
+
+    def test_bundle_body_mode_snippet_limits_context_and_marks_snippet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            long_body = "foo " + ("x" * 2000) + " TAILMARKER\n"
+            generated = build_skill_from_ir_jsonl(
+                tmp_path,
+                lines=[
+                    {
+                        "type": "doc",
+                        "doc_id": "doc1",
+                        "title": "Big Doc",
+                        "source_file": "big.md",
+                        "source_path": "books/big.md",
+                        "source_version": "current",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "doc1",
+                        "node_id": "doc1:article:0001",
+                        "kind": "article",
+                        "label": "第1条",
+                        "title": "第1条 Foo",
+                        "ordinal": 1,
+                        "body_md": long_body,
+                    },
+                ],
+            )
+
+            bundle = run_bundle(
+                generated,
+                query="foo",
+                extra_args=[
+                    "--body",
+                    "snippet",
+                    "--neighbors",
+                    "0",
+                    "--limit",
+                    "5",
+                    "--per-node-max-chars",
+                    "120",
+                    "--max-chars",
+                    "2000",
+                ],
+            )
+            self.assertIn("*(SNIPPET)*", bundle)
+            self.assertNotIn("TAILMARKER", bundle)
 
     def test_bundle_query_mode_and_requires_all_terms(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1298,6 +1978,239 @@ class BuildSkillTests(unittest.TestCase):
             doc_dirs = [p for p in refs_root.iterdir() if p.is_dir()]
             self.assertEqual(len(doc_dirs), 1)
             self.assertEqual(doc_dirs[0].name, "gb-t-1234-2020")
+
+    def test_kbtool_skill_flag_prints_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            data = run_kbtool_json(generated, ["--skill"])
+            self.assertIsInstance(data, dict)
+            self.assertEqual(data.get("tool"), "kbtool")
+            self.assertEqual(data.get("deterministic"), True)
+            self.assertEqual(data.get("skill", {}).get("name"), "my-books")
+            self.assertIn("commands", data)
+            cmd_names = {c.get("name") for c in data.get("commands", []) if isinstance(c, dict)}
+            self.assertIn("bundle", cmd_names)
+            self.assertIn("search", cmd_names)
+            self.assertIn("get-node", cmd_names)
+            self.assertIn("get-children", cmd_names)
+            self.assertIn("get-parent", cmd_names)
+            self.assertIn("get-siblings", cmd_names)
+            self.assertIn("follow-references", cmd_names)
+
+    def test_kbtool_atomic_commands_return_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            node = run_kbtool_json(generated, ["get-node", "standard-v1:article:0003"])
+            self.assertEqual(node.get("node_id"), "standard-v1:article:0003")
+            self.assertEqual(node.get("doc_id"), "standard-v1")
+            self.assertEqual(node.get("kind"), "article")
+            self.assertIn("适用范围", node.get("title", ""))
+            self.assertIn("body_md", node)
+
+            children = run_kbtool_json(generated, ["get-children", "standard-v1:section:chapter01/section-01-01"])
+            self.assertIsInstance(children, dict)
+            child_ids = [c.get("node_id") for c in children.get("children", []) if isinstance(c, dict)]
+            self.assertIn("standard-v1:article:0001", child_ids)
+            self.assertIn("standard-v1:article:0004", child_ids)
+
+            parent = run_kbtool_json(generated, ["get-parent", "standard-v1:article:0002"])
+            self.assertEqual(parent.get("parent", {}).get("node_id"), "standard-v1:section:chapter01/section-01-01")
+
+            sibs = run_kbtool_json(generated, ["get-siblings", "standard-v1:article:0002", "--neighbors", "1"])
+            self.assertIsInstance(sibs, dict)
+            sib_ids = [n.get("node_id") for n in sibs.get("nodes", []) if isinstance(n, dict)]
+            self.assertEqual(sib_ids, ["standard-v1:article:0001", "standard-v1:article:0002", "standard-v1:article:0003"])
+
+            refs = run_kbtool_json(generated, ["follow-references", "standard-v1:article:0003", "--direction", "out"])
+            self.assertIsInstance(refs, dict)
+            ref_ids = [n.get("node_id") for n in refs.get("nodes", []) if isinstance(n, dict)]
+            self.assertIn("standard-v1:article:0001", ref_ids)
+            self.assertIn("standard-v1:article:0004", ref_ids)
+
+    def test_kbtool_auto_root_works_outside_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            other_cwd = Path(other)
+            data = run_kbtool_json(generated, ["--skill"], cwd=other_cwd)
+            self.assertEqual(data.get("skill", {}).get("name"), "my-books")
+
+    def test_build_skill_package_kbtool_flag_is_optional(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = write_fixture(tmp_path, "standard_v1.md")
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(BUILDER),
+                    "--skill-name",
+                    "my-books",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "Controlled Retrieval KB",
+                    "--package-kbtool",
+                ],
+                env={**os.environ, "PYTHONUTF8": "1", "PATH": ""},
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            generated = out_dir / "my-books"
+            self.assertTrue((generated / "kb.sqlite").exists())
+
+    def test_force_rebuild_preserves_existing_bin_binaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_md = write_fixture(tmp_path, "standard_v1.md")
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(BUILDER),
+                    "--skill-name",
+                    "my-books",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "Controlled Retrieval KB",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+            generated = out_dir / "my-books"
+            bin_file = generated / "bin" / "windows-x86_64" / "kbtool.exe"
+            bin_file.parent.mkdir(parents=True, exist_ok=True)
+            bin_file.write_text("dummy", encoding="utf-8")
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(BUILDER),
+                    "--skill-name",
+                    "my-books",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(input_md),
+                    "--title",
+                    "Controlled Retrieval KB",
+                    "--force",
+                ],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(ROOT),
+            )
+
+            self.assertTrue(bin_file.exists(), "Expected existing bin/ binaries to be preserved on --force rebuild")
+
+    def test_generated_skill_writes_root_kbtool_wrappers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            kbtool = generated / "kbtool"
+            kbtool_cmd = generated / "kbtool.cmd"
+            self.assertTrue(kbtool.exists())
+            self.assertTrue(kbtool_cmd.exists())
+
+            proc = subprocess.run(
+                [str(kbtool), "--skill"],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(tmp_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            data = json.loads(proc.stdout)
+            self.assertEqual(data.get("tool"), "kbtool")
+
+    def test_generated_skill_writes_kbtool_sha1(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            sha_path = generated / "kbtool.sha1"
+            self.assertTrue(sha_path.exists())
+            sha = sha_path.read_text(encoding="utf-8").strip()
+            self.assertRegex(sha, r"^[0-9a-f]{40}$")
+
+    def test_kbtool_wrapper_prefers_fresh_binary_and_falls_back_when_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            system = (platform.system() or "").lower()
+            if system.startswith("windows"):
+                os_tag = "windows"
+            elif system.startswith("linux"):
+                os_tag = "linux"
+            elif system.startswith("darwin"):
+                os_tag = "macos"
+            else:
+                os_tag = system or "unknown"
+
+            machine = (platform.machine() or "").lower()
+            if machine in {"amd64", "x64"}:
+                machine = "x86_64"
+            if machine in {"aarch64"}:
+                machine = "arm64"
+            arch_tag = machine or "unknown"
+
+            plat = f"{os_tag}-{arch_tag}"
+            bin_dir = generated / "bin" / plat
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            fake_bin = bin_dir / ("kbtool.exe" if os_tag == "windows" else "kbtool")
+            fake_bin.write_text("#!/usr/bin/env sh\necho BINARY\n", encoding="utf-8")
+            fake_bin.chmod(0o755)
+
+            # Make hashes match => wrapper should use the binary
+            root_sha = generated / "kbtool.sha1"
+            root_sha.write_text("abc\n", encoding="utf-8")
+            (bin_dir / "kbtool.sha1").write_text("abc\n", encoding="utf-8")
+
+            proc = subprocess.run(
+                [str(generated / "kbtool"), "--skill"],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(tmp_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(proc.stdout.strip(), "BINARY")
+
+            # Make hashes mismatch => wrapper should fall back to python script (JSON output)
+            (bin_dir / "kbtool.sha1").write_text("deadbeef\n", encoding="utf-8")
+            proc2 = subprocess.run(
+                [str(generated / "kbtool"), "--skill"],
+                check=True,
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(tmp_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            data = json.loads(proc2.stdout)
+            self.assertEqual(data.get("tool"), "kbtool")
 
 
 if __name__ == "__main__":
