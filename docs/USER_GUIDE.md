@@ -7,13 +7,16 @@ This guide explains how to generate a knowledge-base skill from documents, and h
 - **Generated skill**: an output folder (e.g. `.claude/skills/my-books/`) containing:
   - `references/`: Markdown files you can open and audit
   - `kb.sqlite`: SQLite + FTS5 index used for retrieval
-  - `scripts/kbtool.py`: deterministic CLI used at query time
-- **Deterministic bundle**: instead of letting an LLM assemble context itself, you run `kbtool.py bundle` to produce a single `bundle.md` that includes evidence plus forced provenance.
+  - `kbtool` / `kbtool.cmd`: recommended entrypoints (prefer a fresh matching binary, fall back to Python)
+  - `scripts/kbtool.py` + `scripts/kbtool_lib/`: deterministic CLI implementation used at query time
+  - (Optional) `bin/<platform>/kbtool(.exe)`: PyInstaller packaged single-file executable (no Python required)
+- **Deterministic bundle**: instead of letting an LLM assemble context itself, you run `kbtool bundle` to produce a single `bundle.md` that includes evidence plus forced provenance.
 
 ## Requirements
 
 - Python 3.10+
 - Optional: `pdftotext` (Poppler) for **readable** PDFs
+- Optional: PyInstaller (for `--package-kbtool` to build a native executable)
 
 If your PDF is scanned (image-only), OCR or convert it to text/Markdown first.
 
@@ -26,13 +29,29 @@ python3 pack-builder/scripts/build_skill.py \
   --skill-name my-books \
   --out-dir .claude/skills \
   --inputs /path/to/book1.pdf /path/to/book2.docx /path/to/notes.md \
-  --title "My Document KB"
+  --title "My Document KB" \
+  --package-kbtool
 ```
 
 Notes:
 - `--skill-name` must match `^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]?$`.
 - Use `--force` to overwrite an existing output folder.
 - Use `--out-dir` to place the generated skill anywhere (not tied to `.claude/skills`).
+- `--package-kbtool` builds a binary only for the **current platform**. To ship both Windows+Linux binaries in one skill folder, run packaging on both platforms and keep the same output directory (a `--force` rebuild tries to preserve existing `bin/`).
+
+### (Optional) Build from IR (JSONL)
+
+If you already have a structured node tree (e.g. from a crawler / database / offline preprocessing), you can build from a JSONL IR instead of raw documents:
+
+```bash
+python3 pack-builder/scripts/build_skill.py \
+  --skill-name my-kb \
+  --out-dir .claude/skills \
+  --ir-jsonl /path/to/ir.jsonl \
+  --title "My KB (IR)"
+```
+
+IR v1 supports `type=doc` and `type=node` rows. Recommended node kinds: `article` / `block` / `item`.
 
 ## Search (debug / inspection)
 
@@ -40,7 +59,9 @@ Notes:
 
 ```bash
 cd .claude/skills/my-books
-python3 scripts/kbtool.py search --query "质量保证期限" --out search.md
+./kbtool search --query "质量保证期限" --out search.md
+# Or (python): python3 scripts/kbtool.py search --query "质量保证期限" --out search.md
+# Or (binary): bin/<platform>/kbtool search --query "质量保证期限" --out search.md
 ```
 
 ## Bundle (recommended path)
@@ -49,7 +70,9 @@ python3 scripts/kbtool.py search --query "质量保证期限" --out search.md
 
 ```bash
 cd .claude/skills/my-books
-python3 scripts/kbtool.py bundle --query "适用范围是什么？" --out bundle.md
+./kbtool bundle --query "适用范围是什么？" --out bundle.md
+# Or (python): python3 scripts/kbtool.py bundle --query "适用范围是什么？" --out bundle.md
+# Or (binary): bin/<platform>/kbtool bundle --query "适用范围是什么？" --out bundle.md
 ```
 
 Common options:
@@ -59,6 +82,29 @@ Common options:
 - `--query-mode and|or`: compose the FTS query more strictly/loosely.
 - `--must TERM` (repeatable): terms that must appear (used as additional constraints).
 - `--debug-triggers`: emit diagnostics and one-hop reference expansion.
+- `--enable-hooks`: enable runtime hooks from `hooks/` (see below).
+
+## Atomic commands (JSON output)
+
+The generated tool also exposes atomic subcommands (each does one deterministic thing and prints JSON), useful for LLM tool-chaining:
+
+```bash
+cd .claude/skills/my-books
+./kbtool --skill
+./kbtool get-node "standard-v1:article:0003"
+./kbtool follow-references "standard-v1:article:0003" --direction out
+```
+
+## Runtime hooks (optional, off by default)
+
+Create `hooks/` under the generated skill root and add any of:
+
+- `hooks/pre_search.py`
+- `hooks/post_search.py`
+- `hooks/pre_expand.py`
+- `hooks/pre_render.py`
+
+Each file must export `run(payload: dict) -> dict`. Hooks only run when you pass `--enable-hooks` to `search`/`bundle`.
 
 ## Answering with provenance
 
@@ -72,7 +118,9 @@ If you manually edit files under `references/`, rebuild the SQLite index:
 
 ```bash
 cd .claude/skills/my-books
-python3 scripts/kbtool.py reindex
+./kbtool reindex
+# Or (python): python3 scripts/kbtool.py reindex
+# Or (binary): bin/<platform>/kbtool reindex
 ```
 
 The reindex path uses a “shadow rebuild + atomic switch” approach to reduce the chance of ending up with a partially-built database.

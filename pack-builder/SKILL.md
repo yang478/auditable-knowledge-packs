@@ -1,6 +1,6 @@
 ---
 name: pack-builder
-description: Use when generating an auditable, deterministic knowledge pack from one or more documents (txt/md/docx/readable-pdf), producing `references/` + `kb.sqlite` (FTS5, no embeddings) + `scripts/kbtool.py` for deterministic search→context bundling and citations.
+description: Use when generating an auditable, deterministic knowledge pack from one or more documents (txt/md/docx/readable-pdf), producing `references/` + `kb.sqlite` (FTS5, no embeddings) + a `kbtool` CLI (root wrapper + python scripts + optional per-platform binary) for deterministic search→context bundling and citations.
 ---
 
 # Auditable Knowledge Pack Builder
@@ -9,14 +9,16 @@ Generate a `monitor`-style knowledge base skill from one or more documents:
 
 - Progressive disclosure layout: `references/<doc_id>/{metadata.md,toc.md,chapters/,sections/}`
 - SQLite index for fast non-vector search: `kb.sqlite` (CJK 2-gram + ASCII word tokens in FTS5)
-- Deterministic bundle command: `scripts/kbtool.py bundle` → outputs a single `bundle.md` with forced sources
+- Deterministic bundle command (recommended): `./kbtool bundle` → outputs a single `bundle.md` with forced sources
 - Optional sharded TSV indexes: `indexes/headings/*.tsv`, `indexes/kw/*.tsv` (fallback only)
+  - `scripts/kbtool.py` and `scripts/kbtool_lib/*.py` are the python implementation
+  - `bin/<platform>/kbtool(.exe)` is optional (PyInstaller); root `kbtool` wrapper prefers a fresh matching binary
 
 ## Controlled Retrieval V1
 
 - 在线主流程固定为：标题/正文/术语 三路召回 → 确定性融合排序 → 最多一轮补查 → `bundle.md`
 - 一轮补查只允许 `definition`、`references`、`version_metadata` 这类受控动作
-- `python3 scripts/kbtool.py reindex` 使用 shadow rebuild + 原子重建（atomic switch）来激活新版本，并保留旧版本文档行为非激活记录
+- `./kbtool reindex`（或 `python3 scripts/kbtool.py reindex`）使用 shadow rebuild + 原子重建（atomic switch）来激活新版本，并保留旧版本文档行为非激活记录
 
 ## Quick Start
 
@@ -42,9 +44,21 @@ Generate a `monitor`-style knowledge base skill from one or more documents:
 ```
 .claude/skills/<skill-name>/
   SKILL.md
+  kbtool                  # recommended entrypoint (POSIX wrapper)
+  kbtool.cmd              # Windows wrapper
+  kbtool.sha1             # stable hash of python sources
   kb.sqlite
+  bin/
+    <platform>/           # optional per-platform binary build (PyInstaller)
+      kbtool(.exe)
+      kbtool.sha1         # copy of kbtool.sha1 for freshness check
   scripts/
-    kbtool.py             # bundle generator (deterministic, recommended)
+    kbtool.py             # python entrypoint (deterministic)
+    kbtool_lib/           # implementation modules (db/search/bundle/hooks/skill-json…)
+    reindex.py            # TSV-only reindex helper (fallback)
+  catalog/
+    categories.md
+    categories/
   indexes/
     headings/            # sharded TSV title→path
     kw/                  # sharded TSV keyword→path (fallback only)
@@ -59,7 +73,7 @@ Generate a `monitor`-style knowledge base skill from one or more documents:
 ## Robustness Rules (Do Not Skip)
 
 - Prefer “structure-first”: if the document has headings, preserve them; don’t “chunk by size” unless necessary.
-- Prefer deterministic search→bundle: run `python3 scripts/kbtool.py bundle --query "..." --out bundle.md`, then answer from `bundle.md`.
+- Prefer deterministic search→bundle: run `./kbtool bundle --query "..." --out bundle.md`, then answer from `bundle.md`.
 - Prefer the controlled retrieval path: let `bundle` perform 标题/正文/术语 三路召回 and inspect `## 补查记录` when a one-round expansion was triggered.
 - Prefer “path-direct” only when user specifies chapter/section: open `references/<doc_id>/toc.md`, then open the target file.
 - Treat `indexes/*` as fallback only; never load a whole large index file if a smaller shard or TOC suffices.

@@ -10,7 +10,9 @@
 
 - `references/`：可人工审计的 Markdown 文件树（章/节/条/块）
 - `kb.sqlite`：SQLite + FTS5 索引（中文 CJK 2-gram + 英文/数字词；无需向量库）
-- `scripts/kbtool.py`：确定性的 `search`/`bundle`/`reindex` 命令，把 query 变成一个 `bundle.md`（并附带指向 `references/` 的来源清单）
+- `kbtool` / `kbtool.cmd`：根目录入口（优先匹配当前平台 fresh binary，回退到 Python）
+- `scripts/kbtool.py` + `scripts/kbtool_lib/`：确定性的 `search`/`bundle`/`reindex` 命令，把 query 变成一个 `bundle.md`（并附带指向 `references/` 的来源清单）
+- `bin/<platform>/kbtool(.exe)`：可选（PyInstaller）单文件二进制（需按平台分别构建）
 
 ## 为什么要这样设计（审计优先）
 
@@ -30,7 +32,7 @@
 
 - **向量/embedding-first 框架**（LangChain/LlamaIndex/RAGFlow 等）擅长语义召回，但需要 embedding 模型 + 向量库；而且当模型、切分策略或 embedding 变化时，引用稳定性更容易漂移。
 - **让模型自己翻文件并写引用**更灵活，但很难复现；不同提示词/不同模型下的证据链一致性也难保证。
-- **纯关键词检索**（grep/Elasticsearch/SQLite FTS）擅长“找字符串”，但仍缺少一个确定性、结构感知的上下文拼装器；`kbtool.py bundle` 通过 rerank + 扩展 + 按预算渲染，把结果稳定收敛到单一证据文件。
+- **纯关键词检索**（grep/Elasticsearch/SQLite FTS）擅长“找字符串”，但仍缺少一个确定性、结构感知的上下文拼装器；`kbtool bundle` 通过 rerank + 扩展 + 按预算渲染，把结果稳定收敛到单一证据文件。
 
 如果你更需要“强语义改写/同义转述”的匹配，混合检索（关键词 + 向量）通常更合适；如果你更需要稳定证据包与可追溯来源，本项目就是为此设计的。
 
@@ -44,7 +46,7 @@
 
 ```text
 文档输入 ──(build_skill.py)──> references/ + kb.sqlite
-提出问题 ──(kbtool.py bundle)─> bundle.md（证据 + 引用）
+提出问题 ──(kbtool bundle)────> bundle.md（证据 + 引用）
 ```
 
 ## 快速开始
@@ -70,7 +72,7 @@ python3 pack-builder/scripts/build_skill.py \
 
 ```bash
 cd .claude/skills/my-books
-python3 scripts/kbtool.py bundle --query "适用范围是什么？" --out bundle.md
+./kbtool bundle --query "适用范围是什么？" --out bundle.md
 ```
 
 打开 `bundle.md`，基于其中内容回答（并复制底部自动生成的“参考依据/来源清单”）。
@@ -86,7 +88,7 @@ python3 scripts/kbtool.py bundle --query "适用范围是什么？" --out bundle
 ```
 pack-builder/
   scripts/build_skill.py        # 生成器 CLI
-  templates/                    # 生成 skill 的模板（kbtool.py, reindex.py）
+  templates/                    # 生成 skill 的模板（kbtool.py, kbtool_lib/, reindex.py）
 docs/
   USER_GUIDE.zh-CN.md           # 使用手册
   ARCHITECTURE.zh-CN.md         # 架构/设计

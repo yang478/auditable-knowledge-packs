@@ -27,8 +27,10 @@ Thumbs.db
 # Tool outputs (generated skills, etc.)
 .claude/
 .worktrees/
-
+.codex/
 # Private / non-OSS docs
 docs/plan/
 docs/plans/
 SECURITY.md
+测试文档/
+newproject/
