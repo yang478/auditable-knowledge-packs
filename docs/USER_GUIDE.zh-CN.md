@@ -71,7 +71,7 @@ cd .claude/skills/my-books
 
 ## Bundle（推荐主路径）
 
-`bundle` 会执行 **search → expand → 按预算渲染**，输出单一证据文件。
+`bundle` 会执行 **确定性迭代检索（≤5 轮）→ expand → 按预算渲染**，输出单一证据文件。
 
 ```bash
 cd .claude/skills/my-books
@@ -80,12 +80,23 @@ cd .claude/skills/my-books
 # 或（binary）：bin/<platform>/kbtool bundle --query "适用范围是什么？" --out bundle.md
 ```
 
+审计说明：
+- `bundle.md` 会包含 `## 检索轨迹`，记录每轮检索的收敛/放宽动作以及最终选中的轮次。
+- 全程不调用任何 LLM；迭代过程中只会调整 `query_mode` 与 `--must` 约束，用于让结果尽量收敛到少数条款/父节点。
+- 出于安全考虑，`--out` 必须指向 **skill 根目录内** 的文件路径（拒绝路径穿越与 root 外绝对路径）。
+
 常用参数：
 - `--neighbors 1`：扩展同一父节点下相邻的前/后叶子节点。
 - `--max-chars 40000`：bundle 总字符预算。
 - `--per-node-max-chars 6000`：单节点过长时截断。
 - `--query-mode and|or`：更严格/更宽松地组合 FTS query。
 - `--must TERM`（可重复）：必须出现的约束项。
+- `--timeout-ms 2000`：SQLite 查询超时保护（0 = 关闭）。
+- 迭代检索参数（可选）：
+  - `--iter-max-rounds 3`：最多迭代轮数（1 = 退化为单轮检索）。
+  - `--iter-focus-max-articles 2`：尝试收敛到不超过 N 个条款/父节点。
+  - `--iter-mass-top3-threshold 0.9`：更严格的收敛阈值。
+  - `--no-iter`：关闭迭代收敛（单轮检索）。
 - `--debug-triggers`：输出诊断信息，并启用一跳补查相关行为。
 - `--enable-hooks`：启用运行时 hooks（见下节）。
 
@@ -110,6 +121,7 @@ cd .claude/skills/my-books
 - `hooks/pre_render.py`：渲染前修改节点展示（如脱敏/替换正文）
 
 每个 hook 文件需提供函数：`run(payload: dict) -> dict`。
+如果存在 `hooks/allowlist.sha1`，kbtool 只会执行 sha1 在 allowlist 中的 hook（每行一个 sha1）。
 
 审计性说明：
 - hooks 会执行本地 Python 代码，请仅在信任该 skill 内容时启用。

@@ -81,12 +81,13 @@ Generate a `monitor`-style knowledge base skill from one or more documents:
 ## Dependency Model (Cross-Platform)
 
 - **Required:** `python3`
-- **PDF (readable)**: uses `pdftotext` if available; otherwise instruct user to convert PDF → TXT/MD first.
+- **PDF (readable)**: prefers `pdftotext` (poppler-utils). If unavailable, the build fails with actionable instructions.
+  - Optional fallback: pass `--pdf-fallback pypdf` (best-effort; requires `pypdf` installed).
 - **DOCX:** uses a built-in OOXML extractor (no third-party Python deps); if extraction fails, instruct user to convert DOCX → MD/TXT.
 
 ## Pressure Scenarios (Self-Test)
 
-- Missing dependencies: build from PDF on a machine without `pdftotext` (should fail with actionable instructions).
+- Missing dependencies: build from PDF on a machine without `pdftotext` (should fail with actionable instructions unless `--pdf-fallback pypdf` is enabled).
 - Mixed inputs: build from `.md` + `.txt` + `.docx` in one run (should succeed).
 - Rebuild safety: output skill folder already exists (should refuse unless `--force` is set).
 - Version roll-forward: editing `references/` and running `python3 scripts/kbtool.py reindex` should create a shadow DB, validate it, then atomically switch.
@@ -100,4 +101,4 @@ Generate a `monitor`-style knowledge base skill from one or more documents:
 ## Red Flags (Stop and Fix)
 
 - “I’ll just open the whole index, it’s easier” → split the question and use TOC/shards.
-- “PDF import failed, so I’ll guess” → stop; convert PDF to text or install `pdftotext`.
+- “PDF import failed, so I’ll guess” → stop; convert PDF to text, install `pdftotext`, or try `--pdf-fallback pypdf` for readable PDFs.

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
 
-from .runtime import die, resolve_root
+from .runtime import die, resolve_root, safe_output_path
 from .text import derive_source_version
 
 
@@ -118,7 +118,7 @@ def cmd_categories(args: argparse.Namespace) -> int:
         die("No docs in manifest.json. Rebuild the skill or check --root.")
     overrides = load_catalog_overrides(root)
     content = render_categories_md(docs, overrides=overrides or None)
-    out_path = (root / args.out).resolve()
+    out_path = safe_output_path(root, args.out)
     out_path.write_text(content, encoding="utf-8", newline="\n")
     print("[OK] Wrote categories:", out_path)
     return 0
@@ -176,7 +176,7 @@ def cmd_docs(args: argparse.Namespace) -> int:
         limit=int(args.limit),
         overrides=overrides or None,
     )
-    out_path = (root / args.out).resolve()
+    out_path = safe_output_path(root, args.out)
     out_path.write_text(content, encoding="utf-8", newline="\n")
     print("[OK] Wrote docs:", out_path)
     return 0
@@ -207,4 +207,3 @@ def load_manifest_docs(root: Path) -> Dict[str, DocRow]:
             is_active=bool(d.get("active_version", d.get("is_active", True))),
         )
     return out
-

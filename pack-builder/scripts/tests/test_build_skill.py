@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -745,7 +746,10 @@ class BuildSkillTests(unittest.TestCase):
             generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
 
             search = run_search(generated, query="适用范围")
-            self.assertLess(search.index("article:003"), search.index("block:0004"))
+            node_ids = re.findall(r"^- node_id: `([^`]+)`", search, flags=re.M)
+            self.assertIn("standard-v1:article:003", node_ids)
+            first_block_idx = next(i for i, nid in enumerate(node_ids) if ":block:" in nid)
+            self.assertLess(node_ids.index("standard-v1:article:003"), first_block_idx)
 
     def test_kbtool_hooks_can_filter_hits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -768,10 +772,12 @@ class BuildSkillTests(unittest.TestCase):
             )
 
             baseline = run_search(generated, query="适用范围")
-            self.assertIn("block:0004", baseline)
+            baseline_node_ids = re.findall(r"^- node_id: `([^`]+)`", baseline, flags=re.M)
+            self.assertTrue(any(":block:" in nid for nid in baseline_node_ids))
 
             filtered = run_search(generated, query="适用范围", extra_args=["--enable-hooks"])
-            self.assertNotIn("block:0004", filtered)
+            filtered_node_ids = re.findall(r"^- node_id: `([^`]+)`", filtered, flags=re.M)
+            self.assertFalse(any(":block:" in nid for nid in filtered_node_ids))
 
     def test_kbtool_pre_search_hook_can_rewrite_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1171,9 +1177,10 @@ class BuildSkillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             input_md = tmp_path / "plain.md"
+            long_tail = "x" * 3500
             input_md.write_text(
-                "Paragraph one foo.\n\n"
-                "Paragraph two foo foo foo foo foo.\n",
+                f"Paragraph one foo. {long_tail}\n\n"
+                "Paragraph two " + ("foo " * 800) + "\n",
                 encoding="utf-8",
             )
 
@@ -1282,9 +1289,10 @@ class BuildSkillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             input_md = tmp_path / "plain.md"
+            long_tail = "x" * 3500
             input_md.write_text(
-                "Paragraph one foo.\n\n"
-                "Paragraph two foo foo foo foo foo.\n",
+                f"Paragraph one foo. {long_tail}\n\n"
+                "Paragraph two " + ("foo " * 800) + "\n",
                 encoding="utf-8",
             )
 
@@ -1419,10 +1427,11 @@ class BuildSkillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             input_md = tmp_path / "plain.md"
+            long_tail = "x" * 3500
             input_md.write_text(
-                "Paragraph one foo.\n\n"
-                "Paragraph two bar.\n\n"
-                "Paragraph three foo bar.\n",
+                f"Paragraph one foo. {long_tail}\n\n"
+                f"Paragraph two bar. {long_tail}\n\n"
+                f"Paragraph three foo bar. {long_tail}\n",
                 encoding="utf-8",
             )
 
@@ -1477,10 +1486,11 @@ class BuildSkillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             input_md = tmp_path / "plain.md"
+            long_tail = "x" * 3500
             input_md.write_text(
-                "Paragraph one foo.\n\n"
-                "Paragraph two foo.\n\n"
-                "Paragraph three foo bar.\n",
+                f"Paragraph one foo. {long_tail}\n\n"
+                f"Paragraph two foo. {long_tail}\n\n"
+                f"Paragraph three foo bar. {long_tail}\n",
                 encoding="utf-8",
             )
 
@@ -1530,6 +1540,278 @@ class BuildSkillTests(unittest.TestCase):
             self.assertIn("`plain:block:0003`", bundle)
             self.assertNotIn("`plain:block:0001`", bundle)
             self.assertNotIn("`plain:block:0002`", bundle)
+
+    def test_bundle_emits_search_trace_and_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            first = run_bundle(generated, query="适用范围")
+            second = run_bundle(generated, query="适用范围")
+            self.assertEqual(first, second)
+
+            self.assertIn("## 检索轨迹", first)
+            self.assertIn("round=0", first)
+            self.assertIn("stop:", first)
+
+    def test_kbtool_refuses_to_write_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+            outside = generated.parent / "pwn.md"
+
+            proc = subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "bundle",
+                    "--query",
+                    "适用范围",
+                    "--neighbors",
+                    "0",
+                    "--out",
+                    "../pwn.md",
+                ],
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("Refusing to write outside skill root", proc.stdout)
+            self.assertFalse(outside.exists())
+
+    def test_bundle_accepts_timeout_ms_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            bundle = run_bundle(generated, query="适用范围", extra_args=["--timeout-ms", "5000", "--neighbors", "0"])
+            self.assertIn("## 参考依据", bundle)
+
+    def test_kbtool_hook_allowlist_enforced_when_present(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            hooks_dir = generated / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            hook_path = hooks_dir / "pre_search.py"
+            hook_path.write_text(
+                "\n".join(
+                    [
+                        "def run(payload):",
+                        "    return {}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            digest = hashlib.sha1(hook_path.read_bytes()).hexdigest()
+            (hooks_dir / "allowlist.sha1").write_text("sha1=deadbeef\n", encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "search",
+                    "--query",
+                    "适用范围",
+                    "--out",
+                    str(generated / "search.md"),
+                    "--enable-hooks",
+                ],
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("Hook not allowlisted", proc.stdout)
+
+            (hooks_dir / "allowlist.sha1").write_text(f"sha1={digest}\n", encoding="utf-8")
+            proc2 = subprocess.run(
+                [
+                    "python3",
+                    str(generated / "scripts" / "kbtool.py"),
+                    "search",
+                    "--query",
+                    "适用范围",
+                    "--out",
+                    str(generated / "search.md"),
+                    "--enable-hooks",
+                ],
+                env={**os.environ, "PYTHONUTF8": "1"},
+                cwd=str(generated),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stdout)
+
+    def test_bundle_iterative_search_focuses_to_few_articles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_skill_from_ir_jsonl(
+                tmp_path,
+                lines=[
+                    {
+                        "type": "doc",
+                        "doc_id": "demo",
+                        "title": "Demo Doc",
+                        "source_file": "demo.md",
+                        "source_version": "v1",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0001",
+                        "kind": "article",
+                        "label": "第1条",
+                        "title": "第1条 流程",
+                        "ordinal": 1,
+                        "body_md": "本条只包含：流程。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0002",
+                        "kind": "article",
+                        "label": "第2条",
+                        "title": "第2条 审批",
+                        "ordinal": 2,
+                        "body_md": "本条只包含：审批。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0003",
+                        "kind": "article",
+                        "label": "第3条",
+                        "title": "第3条 回滚",
+                        "ordinal": 3,
+                        "body_md": "本条只包含：回滚。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0004",
+                        "kind": "article",
+                        "label": "第4条",
+                        "title": "第4条 流程与审批",
+                        "ordinal": 4,
+                        "body_md": "本条包含：流程 审批。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0005",
+                        "kind": "article",
+                        "label": "第5条",
+                        "title": "第5条 流程审批回滚总览",
+                        "ordinal": 5,
+                        "body_md": "本条包含：流程 审批 回滚。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0006",
+                        "kind": "article",
+                        "label": "第6条",
+                        "title": "第6条 其他",
+                        "ordinal": 6,
+                        "body_md": "无关内容。\n",
+                    },
+                ],
+            )
+
+            bundle = run_bundle(generated, query="流程 审批 回滚")
+            self.assertIn("## 检索轨迹", bundle)
+            self.assertIn("round=1", bundle)
+            self.assertIn("query_mode=and", bundle)
+
+            node_ids = re.findall(r"- node_id: `([^`]+)`", bundle)
+            article_ids = {nid for nid in node_ids if ":article:" in nid}
+            self.assertLessEqual(len(article_ids), 3)
+            self.assertTrue(any(nid.endswith(":article:005") for nid in article_ids))
+
+    def test_bundle_iterative_search_can_be_capped_to_single_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_skill_from_ir_jsonl(
+                tmp_path,
+                lines=[
+                    {
+                        "type": "doc",
+                        "doc_id": "demo",
+                        "title": "Demo Doc",
+                        "source_file": "demo.md",
+                        "source_version": "v1",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0001",
+                        "kind": "article",
+                        "label": "第1条",
+                        "title": "第1条 流程",
+                        "ordinal": 1,
+                        "body_md": "本条只包含：流程。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0002",
+                        "kind": "article",
+                        "label": "第2条",
+                        "title": "第2条 审批",
+                        "ordinal": 2,
+                        "body_md": "本条只包含：审批。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0003",
+                        "kind": "article",
+                        "label": "第3条",
+                        "title": "第3条 回滚",
+                        "ordinal": 3,
+                        "body_md": "本条只包含：回滚。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0004",
+                        "kind": "article",
+                        "label": "第4条",
+                        "title": "第4条 流程与审批",
+                        "ordinal": 4,
+                        "body_md": "本条包含：流程 审批。\n",
+                    },
+                    {
+                        "type": "node",
+                        "doc_id": "demo",
+                        "node_id": "demo:article:0005",
+                        "kind": "article",
+                        "label": "第5条",
+                        "title": "第5条 流程审批回滚总览",
+                        "ordinal": 5,
+                        "body_md": "本条包含：流程 审批 回滚。\n",
+                    },
+                ],
+            )
+
+            bundle = run_bundle(generated, query="流程 审批 回滚", extra_args=["--iter-max-rounds", "1"])
+            self.assertIn("## 检索轨迹", bundle)
+            self.assertIn("round=0", bundle)
+            self.assertNotIn("round=1", bundle)
 
     def test_kbtool_search_writes_markdown_with_snippets_and_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1862,7 +2144,7 @@ class BuildSkillTests(unittest.TestCase):
             doc_dir = doc_dirs[0]
             self.assertTrue((doc_dir / "blocks").exists())
             block_files = sorted((doc_dir / "blocks").glob("*.md"))
-            self.assertGreaterEqual(len(block_files), 2)
+            self.assertGreaterEqual(len(block_files), 1)
 
             bundle_path = generated / "bundle.md"
             subprocess.run(
@@ -1944,6 +2226,38 @@ class BuildSkillTests(unittest.TestCase):
 
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("pdftotext", proc.stderr)
+
+    def test_pdf_without_pdftotext_can_try_pypdf_fallback_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dummy_pdf = tmp_path / "a.pdf"
+            dummy_pdf.write_bytes(b"%PDF-1.4\n% dummy\n")
+
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+
+            proc = subprocess.run(
+                [
+                    "python3",
+                    str(BUILDER),
+                    "--skill-name",
+                    "pdf-kb",
+                    "--out-dir",
+                    str(out_dir),
+                    "--inputs",
+                    str(dummy_pdf),
+                    "--pdf-fallback",
+                    "pypdf",
+                ],
+                env={**os.environ, "PYTHONUTF8": "1", "BOOK_SKILL_GENERATOR_NO_PDFTOTEXT": "1"},
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("pypdf", proc.stderr.lower())
 
     def test_doc_id_derives_from_standardized_filename_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

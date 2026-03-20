@@ -10,12 +10,43 @@ from xml.etree import ElementTree as ET
 from .fs_utils import die, read_text, which
 
 
-def _extract_pdf_to_text(path: Path) -> str:
+def _extract_pdf_to_text(path: Path, *, pdf_fallback: str) -> str:
     pdftotext = which("pdftotext")
     if not pdftotext:
+        if str(pdf_fallback).strip().lower() == "pypdf":
+            try:
+                from pypdf import PdfReader  # type: ignore[import-not-found]
+            except ImportError:
+                try:
+                    from PyPDF2 import PdfReader  # type: ignore[import-not-found]
+                except ImportError:
+                    die(
+                        "PDF import fallback requested (--pdf-fallback pypdf), but `pypdf` is not installed.\n"
+                        "Install it (recommended): pip install pypdf\n"
+                        "Or install `pdftotext` (poppler-utils), or convert PDF → .txt/.md first."
+                    )
+            try:
+                reader = PdfReader(str(path))
+            except Exception as exc:
+                die(f"pypdf failed to read PDF: {path.name} ({type(exc).__name__}: {exc})")
+            out: List[str] = []
+            for idx, page in enumerate(getattr(reader, "pages", []) or []):
+                try:
+                    text = page.extract_text() or ""
+                except Exception as exc:
+                    die(f"pypdf failed to extract text: {path.name} page={idx} ({type(exc).__name__}: {exc})")
+                if text:
+                    out.append(text)
+            extracted = "\n\n".join(out).strip()
+            if not extracted:
+                die(
+                    "pypdf extracted empty text. Try installing `pdftotext` (poppler-utils), or convert PDF → .txt/.md first."
+                )
+            return extracted + "\n"
         die(
             "PDF import requires `pdftotext` (poppler-utils). Install it, or convert PDF to .txt/.md first.\n"
-            "Tip (Ubuntu): sudo apt-get install poppler-utils"
+            "Tip (Ubuntu): sudo apt-get install poppler-utils\n"
+            "Tip: If you can't install it, try: --pdf-fallback pypdf (best-effort, requires `pypdf`)."
         )
     proc = subprocess.run(
         [pdftotext, "-layout", str(path), "-"],
@@ -101,7 +132,7 @@ def _infer_text_headings_to_markdown(text: str) -> str:
     return md
 
 
-def extract_to_markdown(path: Path) -> str:
+def extract_to_markdown(path: Path, *, pdf_fallback: str = "none") -> str:
     suffix = path.suffix.lower()
     if suffix == ".md":
         return read_text(path)
@@ -110,5 +141,5 @@ def extract_to_markdown(path: Path) -> str:
     if suffix == ".docx":
         return _extract_docx_to_markdown(path)
     if suffix == ".pdf":
-        return _infer_text_headings_to_markdown(_extract_pdf_to_text(path))
+        return _infer_text_headings_to_markdown(_extract_pdf_to_text(path, pdf_fallback=pdf_fallback))
     die(f"Unsupported input type: {path.name} (supported: .md .txt .docx .pdf)")

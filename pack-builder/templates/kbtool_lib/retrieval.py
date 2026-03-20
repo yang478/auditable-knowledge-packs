@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sqlite3
 import unicodedata
@@ -8,13 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .runtime import die, open_db, print_json, resolve_root, run_hook, sha1_file
+from .runtime import SqliteTimeout, die, open_db, print_json, resolve_root, run_hook, safe_output_path, sha1_file
 from .text import (
     build_match_expression,
     build_match_query,
     core_alias_title,
     count_occurrences,
     extract_window,
+    fts_tokens,
     is_cjk,
     markdown_to_plain,
     normalize_alias_text,
@@ -41,6 +43,17 @@ class Node:
     is_leaf: bool
     body_md: str
     body_plain: str
+
+
+@dataclass(frozen=True)
+class NodeLinks:
+    node_id: str
+    doc_id: str
+    kind: str
+    parent_id: Optional[str]
+    prev_id: Optional[str]
+    next_id: Optional[str]
+    ordinal: int
 
 
 def node_to_dict(node: Node, *, include_body: bool) -> Dict[str, object]:
@@ -204,9 +217,10 @@ def search_body_nodes(
         return []
     rows = conn.execute(
         """
-        SELECT n.node_id, bm25(node_fts) AS bm25
+        SELECT n.node_id, n.title, t.body_plain, bm25(node_fts) AS bm25
         FROM node_fts
         JOIN nodes n ON n.node_key = node_fts.node_key
+        JOIN node_text t ON t.node_key = n.node_key
         WHERE node_fts MATCH ? AND n.is_active = 1 AND n.is_leaf = 1
         ORDER BY bm25(node_fts), n.node_id
         LIMIT ?
@@ -226,15 +240,38 @@ def search_body_nodes(
     for row in rows:
         node_id = str(row["node_id"])
         bm25 = float(row["bm25"])
-        node = get_node(conn, node_id)
-        title_hay = node.title.lower()
-        body_hay = node.body_plain.lower()
+        title_hay = str(row["title"] or "").lower()
+        body_hay = str(row["body_plain"] or "").lower()
         occ_title = sum(count_occurrences(title_hay, term.lower()) for term in terms)
         occ_body = sum(count_occurrences(body_hay, term.lower()) for term in terms)
         score = occ_title * 1000 + occ_body * 100
         scored.append((score, -bm25, node_id))
     scored.sort(reverse=True)
     return [node_id for _, _, node_id in scored[:limit]]
+
+
+def get_node_links(conn: sqlite3.Connection, node_id: str) -> NodeLinks:
+    row = conn.execute(
+        """
+        SELECT node_id, doc_id, kind, parent_id, prev_id, next_id, ordinal
+        FROM nodes
+        WHERE node_id = ? AND is_active = 1
+        ORDER BY source_version DESC
+        LIMIT 1
+        """,
+        (node_id,),
+    ).fetchone()
+    if not row:
+        die(f"Unknown node_id: {node_id}")
+    return NodeLinks(
+        node_id=str(row["node_id"]),
+        doc_id=str(row["doc_id"]),
+        kind=str(row["kind"]),
+        parent_id=str(row["parent_id"]) if row["parent_id"] else None,
+        prev_id=str(row["prev_id"]) if row["prev_id"] else None,
+        next_id=str(row["next_id"]) if row["next_id"] else None,
+        ordinal=int(row["ordinal"]),
+    )
 
 
 def open_node(conn: sqlite3.Connection, node_id: str) -> sqlite3.Row:
@@ -283,12 +320,12 @@ def get_node(conn: sqlite3.Connection, node_id: str) -> Node:
 
 
 def elevate_to_article(conn: sqlite3.Connection, node_id: str) -> str:
-    n = get_node(conn, node_id)
+    n = get_node_links(conn, node_id)
     if n.kind == "article":
         return n.node_id
     cur = n
     while cur.parent_id:
-        parent = get_node(conn, cur.parent_id)
+        parent = get_node_links(conn, cur.parent_id)
         if parent.kind == "article":
             return parent.node_id
         cur = parent
@@ -297,11 +334,10 @@ def elevate_to_article(conn: sqlite3.Connection, node_id: str) -> str:
 
 def iter_parents(conn: sqlite3.Connection, node: Node) -> List[str]:
     out: List[str] = []
-    cur = node
-    while cur.parent_id:
-        pid = cur.parent_id
-        out.append(pid)
-        cur = get_node(conn, pid)
+    parent_id = node.parent_id
+    while parent_id:
+        out.append(parent_id)
+        parent_id = get_node_links(conn, parent_id).parent_id
     out.reverse()
     return out
 
@@ -312,28 +348,28 @@ def iter_neighbors(conn: sqlite3.Connection, node: Node, neighbors: int) -> List
     out: List[str] = []
 
     prev_ids: List[str] = []
-    cur = node
+    prev_id = node.prev_id
     for _ in range(neighbors):
-        if not cur.prev_id:
+        if not prev_id:
             break
-        p = get_node(conn, cur.prev_id)
+        p = get_node_links(conn, prev_id)
         if p.parent_id != node.parent_id:
             break
         prev_ids.append(p.node_id)
-        cur = p
+        prev_id = p.prev_id
     prev_ids.reverse()
     out.extend(prev_ids)
     out.append(node.node_id)
 
-    cur = node
+    next_id = node.next_id
     for _ in range(neighbors):
-        if not cur.next_id:
+        if not next_id:
             break
-        n = get_node(conn, cur.next_id)
+        n = get_node_links(conn, next_id)
         if n.parent_id != node.parent_id:
             break
         out.append(n.node_id)
-        cur = n
+        next_id = n.next_id
     return out
 
 
@@ -414,6 +450,268 @@ def search_leaf_nodes(
     return [node_id for _, _, _, node_id in ordered_scores[:limit]]
 
 
+def _query_has_multiple_terms(raw_query: str) -> bool:
+    parts = [p for p in query_terms(raw_query) if p.strip()]
+    return len(parts) >= 2
+
+
+def _format_trace_must(must_terms: Sequence[str]) -> str:
+    return json.dumps([str(t) for t in must_terms if str(t).strip()], ensure_ascii=False)
+
+
+def _article_focus_metrics(
+    conn: sqlite3.Connection,
+    leaf_hits: Sequence[str],
+    *,
+    focus_k: int,
+) -> Tuple[int, float, float]:
+    k = max(0, min(int(focus_k), len(leaf_hits)))
+    if k <= 0:
+        return (0, 0.0, 0.0)
+
+    total = 0
+    article_weights: Dict[str, int] = {}
+    for idx, node_id in enumerate(leaf_hits[:k]):
+        article_id = elevate_to_article(conn, node_id)
+        w = k - idx
+        total += w
+        article_weights[article_id] = article_weights.get(article_id, 0) + w
+
+    ranked = sorted(article_weights.items(), key=lambda item: (-item[1], item[0]))
+    diversity = len(ranked)
+    top3 = sum(w for _, w in ranked[:3])
+    mass_top3 = float(top3) / float(total) if total else 0.0
+
+    top1 = ranked[0][1] if ranked else 0
+    top2 = ranked[1][1] if len(ranked) > 1 else 0
+    margin = float(top1 - top2) / float(total) if total else 0.0
+
+    return diversity, mass_top3, margin
+
+
+@dataclass(frozen=True)
+class IterativeSearchResult:
+    hits: List[str]
+    query_mode: str
+    must_terms: List[str]
+    trace_lines: List[str]
+
+
+def iterative_search_leaf_nodes(
+    conn: sqlite3.Connection,
+    raw_query: str,
+    *,
+    limit: int,
+    query_mode: str,
+    must_terms: Sequence[str],
+    max_rounds: int = 5,
+    focus_k: int = 12,
+    focus_max_articles: int = 3,
+    mass_top3_threshold: float = 0.8,
+) -> IterativeSearchResult:
+    focus_k = max(1, int(focus_k))
+    focus_max_articles = max(1, int(focus_max_articles))
+    try:
+        mass_top3_threshold = float(mass_top3_threshold)
+    except (TypeError, ValueError):
+        mass_top3_threshold = 0.8
+    mass_top3_threshold = max(0.0, min(1.0, mass_top3_threshold))
+
+    base_must = [str(t).strip() for t in must_terms if str(t).strip()]
+    auto_must: List[str] = []
+    trace: List[str] = []
+
+    normalized = normalize_query(raw_query)
+    candidate_must: List[str] = []
+    seen_terms: set[str] = set()
+    for t in [*normalized.article_terms, *normalized.title_terms, *fts_tokens(raw_query)]:
+        term = str(t).strip()
+        if not term or term in seen_terms:
+            continue
+        seen_terms.add(term)
+        candidate_must.append(term)
+
+    multi_terms = _query_has_multiple_terms(raw_query)
+    attempted_and = query_mode == "and"
+
+    best_obj: Optional[float] = None
+    best_div: int = 1_000_000
+    best_mass: float = 0.0
+    best_margin: float = 0.0
+    best_round: int = 0
+    best_hits: List[str] = []
+    best_qm: str = query_mode
+    best_must: List[str] = list(base_must)
+
+    stop_reason = "max_rounds"
+    stop_detail = ""
+
+    seen_states: set[Tuple[str, Tuple[str, ...]]] = set()
+
+    rounds = max(1, min(int(max_rounds), 5))
+    single_round = rounds <= 1
+    trace.append(
+        " ".join(
+            [
+                "params:",
+                f"max_rounds={rounds}",
+                f"focus_k={focus_k}",
+                f"focus_max_articles={focus_max_articles}",
+                f"mass_top3_threshold={mass_top3_threshold:.2f}",
+            ]
+        )
+    )
+    for i in range(rounds):
+        round_qm = query_mode
+        effective_must = [*base_must, *auto_must]
+        state_key = (round_qm, tuple(effective_must))
+        if state_key in seen_states:
+            stop_reason = "repeat_state"
+            stop_detail = f"query_mode={round_qm} must={_format_trace_must(effective_must)}"
+            break
+        seen_states.add(state_key)
+
+        hits = search_leaf_nodes(
+            conn,
+            raw_query,
+            limit=limit,
+            query_mode=round_qm,
+            must_terms=effective_must,
+        )
+
+        if not hits:
+            action = "stop"
+            reason = "no_hits"
+            if auto_must:
+                removed = auto_must.pop()
+                action = f"relax:pop_must={removed}"
+                reason = "no_hits"
+                stop_reason = "relax_then_retry"
+            elif round_qm == "and" and multi_terms:
+                query_mode = "or"
+                action = "relax:set_query_mode=or"
+                reason = "no_hits"
+                stop_reason = "relax_then_retry"
+            else:
+                stop_reason = "no_hits"
+            trace.append(
+                " ".join(
+                    [
+                        f"round={i}",
+                        f"query_mode={round_qm}",
+                        f"must={_format_trace_must(effective_must)}",
+                        "hits=0",
+                        "articles@0=0",
+                        "mass_top3=0.00",
+                        "margin=0.00",
+                        f"action={action}",
+                        f"reason={reason}",
+                    ]
+                )
+            )
+            if stop_reason == "no_hits":
+                break
+            continue
+
+        k = min(int(focus_k), len(hits), limit)
+        diversity, mass_top3, margin = _article_focus_metrics(conn, hits, focus_k=k)
+        objective = 100.0 * mass_top3 - 10.0 * float(diversity) + 5.0 * margin
+
+        is_better = False
+        if best_obj is None or objective > best_obj + 1e-9:
+            is_better = True
+        elif best_obj is not None and abs(objective - best_obj) <= 1e-9:
+            # Stable tiebreakers: fewer articles, higher mass, higher margin, earlier round
+            if diversity < best_div:
+                is_better = True
+            elif diversity == best_div and mass_top3 > best_mass + 1e-9:
+                is_better = True
+            elif diversity == best_div and abs(mass_top3 - best_mass) <= 1e-9 and margin > best_margin + 1e-9:
+                is_better = True
+
+        if is_better:
+            best_obj = objective
+            best_div = diversity
+            best_mass = mass_top3
+            best_margin = margin
+            best_round = i
+            best_hits = list(hits)
+            best_qm = round_qm
+            best_must = list(effective_must)
+
+        converged = diversity <= int(focus_max_articles) and mass_top3 >= float(mass_top3_threshold)
+
+        action = "stop" if converged else "tighten"
+        reason = "converged" if converged else "focus_articles"
+
+        if not converged and single_round:
+            action = "stop"
+            reason = "max_rounds"
+            stop_reason = "max_rounds"
+            stop_detail = "single_round"
+        elif not converged:
+            if round_qm == "or" and multi_terms and not attempted_and:
+                query_mode = "and"
+                attempted_and = True
+                action = "tighten:set_query_mode=and"
+                reason = "articles_too_diverse"
+            else:
+                next_term = ""
+                used = set(effective_must)
+                for term in candidate_must:
+                    if term in used:
+                        continue
+                    next_term = term
+                    break
+                if next_term:
+                    auto_must.append(next_term)
+                    action = f"tighten:add_must={next_term}"
+                    reason = "articles_too_diverse"
+                else:
+                    stop_reason = "no_more_terms"
+                    action = "stop"
+                    reason = "no_more_terms"
+
+        trace.append(
+            " ".join(
+                [
+                    f"round={i}",
+                    f"query_mode={round_qm}",
+                    f"must={_format_trace_must(effective_must)}",
+                    f"hits={len(hits)}",
+                    f"articles@{k}={diversity}",
+                    f"mass_top3={mass_top3:.2f}",
+                    f"margin={margin:.2f}",
+                    f"objective={objective:.2f}",
+                    f"action={action}",
+                    f"reason={reason}",
+                ]
+            )
+        )
+
+        if converged:
+            stop_reason = "converged"
+            stop_detail = f"articles@{k}={diversity} mass_top3={mass_top3:.2f}"
+            break
+        if single_round:
+            break
+        if stop_reason == "no_more_terms":
+            stop_detail = "candidate_must exhausted"
+            break
+
+    if best_obj is None or not best_hits:
+        # No successful round; return empty hits and trace for caller to error out.
+        return IterativeSearchResult(hits=[], query_mode=best_qm, must_terms=best_must, trace_lines=trace)
+
+    trace.append(
+        f"stop: reason={stop_reason} {stop_detail}".strip()
+        + f" select_round={best_round} query_mode={best_qm} must={_format_trace_must(best_must)}"
+        + f" objective={best_obj:.2f} articles@K={best_div} mass_top3={best_mass:.2f}"
+    )
+
+    return IterativeSearchResult(hits=best_hits, query_mode=best_qm, must_terms=best_must, trace_lines=trace)
+
+
 def display_node_id(node_id: str) -> str:
     match = re.search(r":article:(\d+)$", node_id)
     if not match:
@@ -422,11 +720,11 @@ def display_node_id(node_id: str) -> str:
 
 
 def chronological_key(conn: sqlite3.Connection, node_id: str) -> Tuple[str, Tuple[int, ...], str]:
-    n = get_node(conn, node_id)
+    n = get_node_links(conn, node_id)
     ords: List[int] = [n.ordinal]
     cur = n
     while cur.parent_id:
-        cur = get_node(conn, cur.parent_id)
+        cur = get_node_links(conn, cur.parent_id)
         ords.append(cur.ordinal)
     ords.reverse()
     return (n.doc_id, tuple(ords), n.node_id)
@@ -532,6 +830,7 @@ def render_bundle(
     per_node_max_chars: int,
     body_mode: str,
     order: str,
+    trace_lines: Sequence[str] = (),
     diagnostics: Sequence[str] = (),
     hooks_root: Optional[Path] = None,
     enable_hooks: bool = False,
@@ -556,6 +855,14 @@ def render_bundle(
 
     terms = query_terms(raw_query)
     out_parts: List[str] = [f"# Bundle\n\n- Query: `{raw_query}`\n\n"]
+    if trace_lines:
+        out_parts.append("## 检索轨迹\n")
+        for line in trace_lines:
+            ln = str(line).rstrip()
+            if not ln:
+                continue
+            out_parts.append(f"- {ln}\n")
+        out_parts.append("\n")
     if diagnostics:
         out_parts.append("## 补查记录\n")
         for line in diagnostics:
@@ -650,121 +957,141 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     db_path = root / args.db
     conn = open_db(db_path)
     try:
-        raw_query = args.query
-        query_mode = args.query_mode
-        must_terms = list(args.must)
-        enable_hooks = bool(getattr(args, "enable_hooks", False))
-        diagnostics: List[str] = []
+        timeout_ms = int(getattr(args, "timeout_ms", 0) or 0)
+        with SqliteTimeout(conn, timeout_ms) as timeout:
+            try:
+                raw_query = args.query
+                query_mode = args.query_mode
+                must_terms = list(args.must)
+                enable_hooks = bool(getattr(args, "enable_hooks", False))
+                diagnostics: List[str] = []
 
-        if enable_hooks:
-            out, digest = run_hook(
-                root,
-                "pre_search",
-                {
-                    "stage": "pre_search",
-                    "query": raw_query,
-                    "query_mode": query_mode,
-                    "must": must_terms,
-                },
-            )
-            if digest:
-                diagnostics.append(f"hook: pre_search sha1={digest} path=hooks/pre_search.py")
-            if "query" in out:
-                candidate = str(out.get("query") or "").strip()
-                if candidate:
-                    raw_query = candidate
-            if "query_mode" in out:
-                qm = str(out.get("query_mode") or "").strip().lower()
-                if qm in {"or", "and"}:
-                    query_mode = qm
-            if "must" in out:
-                value = out.get("must")
-                if isinstance(value, list):
-                    must_terms = [str(v).strip() for v in value if str(v).strip()]
+                if enable_hooks:
+                    out, digest = run_hook(
+                        root,
+                        "pre_search",
+                        {
+                            "stage": "pre_search",
+                            "query": raw_query,
+                            "query_mode": query_mode,
+                            "must": must_terms,
+                        },
+                    )
+                    if digest:
+                        diagnostics.append(f"hook: pre_search sha1={digest} path=hooks/pre_search.py")
+                    if "query" in out:
+                        candidate = str(out.get("query") or "").strip()
+                        if candidate:
+                            raw_query = candidate
+                    if "query_mode" in out:
+                        qm = str(out.get("query_mode") or "").strip().lower()
+                        if qm in {"or", "and"}:
+                            query_mode = qm
+                    if "must" in out:
+                        value = out.get("must")
+                        if isinstance(value, list):
+                            must_terms = [str(v).strip() for v in value if str(v).strip()]
 
-        hits = search_leaf_nodes(
-            conn,
-            raw_query,
-            limit=args.limit,
-            query_mode=query_mode,
-            must_terms=must_terms,
-        )
-        if not hits:
-            die("No matches. Try a different query or rebuild indexes.")
-        if enable_hooks:
-            out, digest = run_hook(
-                root,
-                "post_search",
-                {
-                    "stage": "post_search",
-                    "query": raw_query,
-                    "query_mode": query_mode,
-                    "must": must_terms,
-                    "hits": list(hits),
-                },
-            )
-            if digest:
-                diagnostics.append(f"hook: post_search sha1={digest} path=hooks/post_search.py")
-            if "hits" in out:
-                value = out.get("hits")
-                if not isinstance(value, list):
-                    die("Hook post_search must return {'hits': [...]} list")
-                hits = [str(v) for v in value if str(v)]
-        elevated: List[str] = []
-        seen = set()
-        for node_id in hits:
-            article_id = elevate_to_article(conn, node_id)
-            if article_id in seen:
-                continue
-            seen.add(article_id)
-            elevated.append(article_id)
-        if enable_hooks:
-            out, digest = run_hook(
-                root,
-                "pre_expand",
-                {
-                    "stage": "pre_expand",
-                    "query": raw_query,
-                    "hits": list(elevated),
-                },
-            )
-            if digest:
-                diagnostics.append(f"hook: pre_expand sha1={digest} path=hooks/pre_expand.py")
-            if "hits" in out:
-                value = out.get("hits")
-                if not isinstance(value, list):
-                    die("Hook pre_expand must return {'hits': [...]} list")
-                elevated = [str(v) for v in value if str(v)]
+                iter_result = iterative_search_leaf_nodes(
+                    conn,
+                    raw_query,
+                    limit=args.limit,
+                    query_mode=query_mode,
+                    must_terms=must_terms,
+                    max_rounds=(
+                        1
+                        if bool(getattr(args, "no_iter", False))
+                        else max(1, min(5, int(getattr(args, "iter_max_rounds", 5))))
+                    ),
+                    focus_k=max(1, int(getattr(args, "iter_focus_k", 12))),
+                    focus_max_articles=max(1, int(getattr(args, "iter_focus_max_articles", 3))),
+                    mass_top3_threshold=max(0.0, min(1.0, float(getattr(args, "iter_mass_top3_threshold", 0.8)))),
+                )
+                hits = list(iter_result.hits)
+                query_mode = str(iter_result.query_mode or query_mode)
+                must_terms = list(iter_result.must_terms or must_terms)
+                trace_lines = list(iter_result.trace_lines or [])
+                if not hits:
+                    die("No matches. Try a different query or rebuild indexes.")
+                if enable_hooks:
+                    out, digest = run_hook(
+                        root,
+                        "post_search",
+                        {
+                            "stage": "post_search",
+                            "query": raw_query,
+                            "query_mode": query_mode,
+                            "must": must_terms,
+                            "hits": list(hits),
+                        },
+                    )
+                    if digest:
+                        diagnostics.append(f"hook: post_search sha1={digest} path=hooks/post_search.py")
+                    if "hits" in out:
+                        value = out.get("hits")
+                        if not isinstance(value, list):
+                            die("Hook post_search must return {'hits': [...]} list")
+                        hits = [str(v) for v in value if str(v)]
+                elevated: List[str] = []
+                seen = set()
+                for node_id in hits:
+                    article_id = elevate_to_article(conn, node_id)
+                    if article_id in seen:
+                        continue
+                    seen.add(article_id)
+                    elevated.append(article_id)
+                if enable_hooks:
+                    out, digest = run_hook(
+                        root,
+                        "pre_expand",
+                        {
+                            "stage": "pre_expand",
+                            "query": raw_query,
+                            "hits": list(elevated),
+                        },
+                    )
+                    if digest:
+                        diagnostics.append(f"hook: pre_expand sha1={digest} path=hooks/pre_expand.py")
+                    if "hits" in out:
+                        value = out.get("hits")
+                        if not isinstance(value, list):
+                            die("Hook pre_expand must return {'hits': [...]} list")
+                        elevated = [str(v) for v in value if str(v)]
 
-        normalized_query = normalize_query(raw_query)
-        elevated, expansion_diags = apply_triggered_expansion(
-            conn,
-            normalized_query,
-            elevated,
-            force_debug=args.debug_triggers,
-        )
-        diagnostics.extend(expansion_diags)
-        if enable_hooks:
-            pre_render_path = root / "hooks" / "pre_render.py"
-            if pre_render_path.exists():
-                diagnostics.append(f"hook: pre_render sha1={sha1_file(pre_render_path)} path=hooks/pre_render.py")
-        content, _ = render_bundle(
-            conn,
-            elevated,
-            raw_query=raw_query,
-            neighbors=args.neighbors,
-            max_chars=args.max_chars,
-            per_node_max_chars=args.per_node_max_chars,
-            body_mode=args.body,
-            order=args.order,
-            diagnostics=diagnostics,
-            hooks_root=root if enable_hooks else None,
-            enable_hooks=enable_hooks,
-        )
-        out_path = (root / args.out).resolve()
-        out_path.write_text(content, encoding="utf-8", newline="\n")
-        print("[OK] Wrote bundle:", out_path)
-        return 0
+                normalized_query = normalize_query(raw_query)
+                elevated, expansion_diags = apply_triggered_expansion(
+                    conn,
+                    normalized_query,
+                    elevated,
+                    force_debug=args.debug_triggers,
+                )
+                diagnostics.extend(expansion_diags)
+                if enable_hooks:
+                    pre_render_path = root / "hooks" / "pre_render.py"
+                    if pre_render_path.exists():
+                        diagnostics.append(f"hook: pre_render sha1={sha1_file(pre_render_path)} path=hooks/pre_render.py")
+                content, _ = render_bundle(
+                    conn,
+                    elevated,
+                    raw_query=raw_query,
+                    neighbors=args.neighbors,
+                    max_chars=args.max_chars,
+                    per_node_max_chars=args.per_node_max_chars,
+                    body_mode=args.body,
+                    order=args.order,
+                    trace_lines=trace_lines,
+                    diagnostics=diagnostics,
+                    hooks_root=root if enable_hooks else None,
+                    enable_hooks=enable_hooks,
+                )
+                out_path = safe_output_path(root, args.out)
+                out_path.write_text(content, encoding="utf-8", newline="\n")
+                print("[OK] Wrote bundle:", out_path)
+                return 0
+            except sqlite3.OperationalError as e:
+                if timeout.timed_out:
+                    die(f"SQLite query timed out after {timeout_ms}ms")
+                raise
     finally:
         conn.close()
 
@@ -813,82 +1140,89 @@ def cmd_search(args: argparse.Namespace) -> int:
     db_path = root / args.db
     conn = open_db(db_path)
     try:
-        raw_query = args.query
-        query_mode = args.query_mode
-        must_terms = list(args.must)
-        enable_hooks = bool(getattr(args, "enable_hooks", False))
+        timeout_ms = int(getattr(args, "timeout_ms", 0) or 0)
+        with SqliteTimeout(conn, timeout_ms) as timeout:
+            try:
+                raw_query = args.query
+                query_mode = args.query_mode
+                must_terms = list(args.must)
+                enable_hooks = bool(getattr(args, "enable_hooks", False))
 
-        if enable_hooks:
-            out, _ = run_hook(
-                root,
-                "pre_search",
-                {
-                    "stage": "pre_search",
-                    "query": raw_query,
-                    "query_mode": query_mode,
-                    "must": must_terms,
-                },
-            )
-            if "query" in out:
-                candidate = str(out.get("query") or "").strip()
-                if candidate:
-                    raw_query = candidate
-            if "query_mode" in out:
-                qm = str(out.get("query_mode") or "").strip().lower()
-                if qm in {"or", "and"}:
-                    query_mode = qm
-            if "must" in out:
-                value = out.get("must")
-                if isinstance(value, list):
-                    must_terms = [str(v).strip() for v in value if str(v).strip()]
+                if enable_hooks:
+                    out, _ = run_hook(
+                        root,
+                        "pre_search",
+                        {
+                            "stage": "pre_search",
+                            "query": raw_query,
+                            "query_mode": query_mode,
+                            "must": must_terms,
+                        },
+                    )
+                    if "query" in out:
+                        candidate = str(out.get("query") or "").strip()
+                        if candidate:
+                            raw_query = candidate
+                    if "query_mode" in out:
+                        qm = str(out.get("query_mode") or "").strip().lower()
+                        if qm in {"or", "and"}:
+                            query_mode = qm
+                    if "must" in out:
+                        value = out.get("must")
+                        if isinstance(value, list):
+                            must_terms = [str(v).strip() for v in value if str(v).strip()]
 
-        hits = search_leaf_nodes(
-            conn,
-            raw_query,
-            limit=args.limit,
-            query_mode=query_mode,
-            must_terms=must_terms,
-        )
-        if not hits:
-            die("No matches. Try a different query or rebuild indexes.")
-        if enable_hooks:
-            out, digest = run_hook(
-                root,
-                "post_search",
-                {
-                    "stage": "post_search",
-                    "query": raw_query,
-                    "query_mode": query_mode,
-                    "must": must_terms,
-                    "hits": list(hits),
-                },
-            )
-            if "hits" in out:
-                value = out.get("hits")
-                if not isinstance(value, list):
-                    die("Hook post_search must return {'hits': [...]} list")
-                hits = [str(v) for v in value if str(v)]
-        elevated: List[str] = []
-        seen = set()
-        for node_id in hits:
-            article_id = elevate_to_article(conn, node_id)
-            if article_id in seen:
-                continue
-            seen.add(article_id)
-            elevated.append(article_id)
+                hits = search_leaf_nodes(
+                    conn,
+                    raw_query,
+                    limit=args.limit,
+                    query_mode=query_mode,
+                    must_terms=must_terms,
+                )
+                if not hits:
+                    die("No matches. Try a different query or rebuild indexes.")
+                if enable_hooks:
+                    out, digest = run_hook(
+                        root,
+                        "post_search",
+                        {
+                            "stage": "post_search",
+                            "query": raw_query,
+                            "query_mode": query_mode,
+                            "must": must_terms,
+                            "hits": list(hits),
+                        },
+                    )
+                    if "hits" in out:
+                        value = out.get("hits")
+                        if not isinstance(value, list):
+                            die("Hook post_search must return {'hits': [...]} list")
+                        hits = [str(v) for v in value if str(v)]
+                elevated: List[str] = []
+                seen = set()
+                for node_id in hits:
+                    article_id = elevate_to_article(conn, node_id)
+                    if article_id in seen:
+                        continue
+                    seen.add(article_id)
+                    elevated.append(article_id)
 
-        content = render_search_md(
-            conn,
-            elevated,
-            raw_query=raw_query,
-            query_mode=query_mode,
-            must_terms=must_terms,
-            snippet_chars=args.snippet_chars,
-        )
-        out_path = (root / args.out).resolve()
-        out_path.write_text(content, encoding="utf-8", newline="\n")
-        print("[OK] Wrote search:", out_path)
-        return 0
+                content = render_search_md(
+                    conn,
+                    elevated,
+                    raw_query=raw_query,
+                    query_mode=query_mode,
+                    must_terms=must_terms,
+                    snippet_chars=args.snippet_chars,
+                )
+                out_path = safe_output_path(root, args.out)
+                out_path.write_text(content, encoding="utf-8", newline="\n")
+                print("[OK] Wrote search:", out_path)
+                return 0
+            except sqlite3.OperationalError as e:
+                if timeout.timed_out:
+                    die(f"SQLite query timed out after {timeout_ms}ms")
+                raise
     finally:
         conn.close()
 

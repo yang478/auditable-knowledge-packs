@@ -15,10 +15,12 @@ build_skill.py (offline build)
       └─ (optional) writes bin/<platform>/kbtool(.exe) (PyInstaller one-file executable)
 
 kbtool.py bundle (online query)
-  ├─ search: FTS candidates
+  ├─ (optional) hook: pre_search
+  ├─ search: deterministic iterative retrieval (≤5 rounds, focuses to 2–3 articles)
   ├─ rerank: deterministic scoring rules
+  ├─ (optional) hook: post_search / pre_expand
   ├─ expand: neighbors / parent chain / controlled one-hop expansions
-  └─ render: budgeted bundle.md + reference list
+  └─ render: budgeted bundle.md + reference list + search trace
 
 kbtool.py (atomic toolbox)
   ├─ --skill: prints a JSON usage “manual” for LLMs
@@ -30,6 +32,7 @@ kbtool.py (atomic toolbox)
 - **Structure-first**: preserve chapter/section/article structure when possible.
 - **Forced provenance**: every bundled excerpt keeps enough metadata to point back to a file in `references/`.
 - **Deterministic pipeline**: `bundle` is designed to be repeatable across models and prompts.
+- **Auditable trace**: `bundle.md` includes a `## 检索轨迹` section with round-by-round retrieval decisions.
 - **No embeddings**: retrieval relies on SQLite FTS5 with pre-tokenized CJK 2-gram + ASCII word tokens.
 
 ## Flex levers (opt-in)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import traceback
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -20,6 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--ir-jsonl", default="", help="JSONL IR input (type=doc/node rows).")
     parser.add_argument("--title", default="Document Knowledge Base", help="Human-friendly title for the generated skill.")
     parser.add_argument("--force", action="store_true", help="Overwrite output folder if it already exists.")
+    parser.add_argument(
+        "--pdf-fallback",
+        choices=["none", "pypdf"],
+        default="none",
+        help="When `pdftotext` is unavailable, optionally fall back to pure-Python PDF extraction via `pypdf` (best-effort).",
+    )
     parser.add_argument(
         "--package-kbtool",
         action="store_true",
@@ -62,16 +70,30 @@ def main(
     if catalog_assignments and not catalog_assignments.exists():
         die(f"Missing --catalog-assignments file: {catalog_assignments}")
 
-    build_skill_fn(
-        skill_name=skill_name,
-        title=args.title,
-        inputs=inputs,
-        out_dir=out_dir,
-        force=args.force,
-        ir_jsonl=ir_jsonl,
-        catalog_taxonomy=catalog_taxonomy,
-        catalog_assignments=catalog_assignments,
-        package_kbtool=bool(args.package_kbtool),
-    )
+    try:
+        build_skill_fn(
+            skill_name=skill_name,
+            title=args.title,
+            inputs=inputs,
+            out_dir=out_dir,
+            force=args.force,
+            pdf_fallback=str(getattr(args, "pdf_fallback", "none") or "none"),
+            ir_jsonl=ir_jsonl,
+            catalog_taxonomy=catalog_taxonomy,
+            catalog_assignments=catalog_assignments,
+            package_kbtool=bool(args.package_kbtool),
+        )
+    except SystemExit:
+        raise
+    except Exception as exc:
+        lines = [
+            "Build failed due to unexpected error.",
+            f"{type(exc).__name__}: {exc}",
+            "Hint: set PACK_BUILDER_TRACEBACK=1 for a full stack trace.",
+        ]
+        if os.environ.get("PACK_BUILDER_TRACEBACK") or os.environ.get("PACK_BUILDER_DEBUG"):
+            lines.append("")
+            lines.append(traceback.format_exc())
+        die("\n".join(lines))
     print(f"[OK] Generated skill: {out_dir / skill_name}")
     return 0

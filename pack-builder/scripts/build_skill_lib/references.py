@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .fs_utils import die, write_text
-from .text_utils import derive_source_version, markdown_to_plain, normalize_alias_text, stable_hash
+from .text_utils import derive_source_version, normalize_alias_text, stable_hash
 from .types import Heading, InputDoc, NodeRecord
 
 
@@ -109,33 +109,88 @@ def _pack_paragraphs_into_blocks(paragraphs: List[List[str]], *, max_chars: int)
 
     def split_long_paragraph(p: List[str]) -> None:
         chunk: List[str] = []
+        chunk_len = 0
+
+        def push_chunk() -> None:
+            nonlocal chunk, chunk_len
+            if chunk:
+                blocks.append(chunk)
+            chunk = []
+            chunk_len = 0
+
         for line in p:
             if len(line) > max_chars:
-                if chunk:
-                    blocks.append(chunk)
-                    chunk = []
+                push_chunk()
                 for i in range(0, len(line), max_chars):
                     blocks.append([line[i : i + max_chars]])
                 continue
             if not chunk:
                 chunk = [line]
+                chunk_len = len(line)
                 continue
-            candidate = "\n".join(chunk + [line])
-            if len(candidate) > max_chars:
-                blocks.append(chunk)
+            candidate_len = chunk_len + 1 + len(line)
+            if candidate_len > max_chars:
+                push_chunk()
                 chunk = [line]
+                chunk_len = len(line)
             else:
                 chunk.append(line)
-        if chunk:
-            blocks.append(chunk)
+                chunk_len = candidate_len
+        push_chunk()
+
+    cur: List[str] = []
+    cur_len = 0
+
+    def push_cur() -> None:
+        nonlocal cur, cur_len
+        if not cur:
+            return
+        while cur and cur[0].strip() == "":
+            cur.pop(0)
+        while cur and cur[-1].strip() == "":
+            cur.pop()
+        if cur:
+            blocks.append(cur)
+        cur = []
+        cur_len = 0
+
+    def add_line_to_cur(line: str) -> None:
+        nonlocal cur, cur_len
+        if not cur:
+            cur = [line]
+            cur_len = len(line)
+        else:
+            cur.append(line)
+            cur_len += 1 + len(line)
 
     for p in paragraphs:
         if not p:
             continue
-        if len("\n".join(p)) <= max_chars:
-            blocks.append(list(p))
-        else:
-            split_long_paragraph(p)
+        para = list(p)
+        para_len = len(para[0]) + sum(1 + len(line) for line in para[1:]) if para else 0
+        if para_len > max_chars:
+            push_cur()
+            split_long_paragraph(para)
+            continue
+
+        if not cur:
+            for line in para:
+                add_line_to_cur(line)
+            continue
+
+        # Add a blank line between paragraphs to preserve structure.
+        candidate_len = cur_len + 1 + 0 + sum(1 + len(line) for line in para)
+        if candidate_len > max_chars:
+            push_cur()
+            for line in para:
+                add_line_to_cur(line)
+            continue
+
+        add_line_to_cur("")
+        for line in para:
+            add_line_to_cur(line)
+
+    push_cur()
     return blocks
 
 
@@ -291,7 +346,7 @@ def read_ir_jsonl(path: Path) -> Tuple[List[InputDoc], List[NodeRecord]]:
         next_id = str(row.get("next_id") or "").strip() or None
         try:
             ordinal = int(row.get("ordinal") or 0)
-        except Exception:
+        except (TypeError, ValueError):
             ordinal = 0
         body_md = str(row.get("body_md") or row.get("body") or "").rstrip() + "\n"
         source_version = str(row.get("source_version") or "").strip() or docs_by_id[doc_id].source_version
@@ -314,7 +369,7 @@ def read_ir_jsonl(path: Path) -> Tuple[List[InputDoc], List[NodeRecord]]:
                 ref_path=str(row.get("ref_path") or "").strip(),
                 is_leaf=is_leaf,
                 body_md=body_md,
-                body_plain=markdown_to_plain(body_md),
+                body_plain="",
                 source_version=source_version,
                 is_active=is_active,
                 aliases=aliases,
@@ -462,6 +517,8 @@ def generate_doc(
 
             article_node_id = f"{doc.doc_id}:article:{article_counter:04d}"
             article_body_md = "\n".join(a_lines).strip() + "\n"
+            article_node_hash = stable_hash(article_body_md)
+            article_span_end = max(1, len(article_body_md))
 
             article_node = NodeRecord(
                 node_id=article_node_id,
@@ -476,9 +533,11 @@ def generate_doc(
                 ordinal=article_counter,
                 ref_path=article_rel,
                 is_leaf=True,
-                body_md=article_body_md,
-                body_plain=markdown_to_plain(article_body_md),
+                body_md="",
+                body_plain="",
                 source_version=doc.source_version,
+                raw_span_end=article_span_end,
+                node_hash=article_node_hash,
             )
             if prev_article:
                 prev_article.next_id = article_node.node_id
@@ -514,6 +573,8 @@ def generate_doc(
                     item_path = item_dir / f"item-{item_idx:02d}.md"
                     item_rel = rel(item_path)
                     item_body_md = "\n".join(i_lines).strip() + "\n"
+                    item_node_hash = stable_hash(item_body_md)
+                    item_span_end = max(1, len(item_body_md))
 
                     item_node = NodeRecord(
                         node_id=item_node_id,
@@ -528,9 +589,11 @@ def generate_doc(
                         ordinal=item_idx,
                         ref_path=item_rel,
                         is_leaf=True,
-                        body_md=item_body_md,
-                        body_plain=markdown_to_plain(item_body_md),
+                        body_md="",
+                        body_plain="",
                         source_version=doc.source_version,
+                        raw_span_end=item_span_end,
+                        node_hash=item_node_hash,
                     )
                     if prev_item:
                         prev_item.next_id = item_node.node_id
@@ -580,6 +643,8 @@ def generate_doc(
             block_path = blocks_dir / f"{block_id}.md"
             block_rel = rel(block_path)
             block_body_md = "\n".join(b_lines).strip() + "\n"
+            block_node_hash = stable_hash(block_body_md)
+            block_span_end = max(1, len(block_body_md))
 
             title = block_id
             for raw in b_lines:
@@ -606,9 +671,11 @@ def generate_doc(
                 ordinal=block_counter,
                 ref_path=block_rel,
                 is_leaf=True,
-                body_md=block_body_md,
-                body_plain=markdown_to_plain(block_body_md),
+                body_md="",
+                body_plain="",
                 source_version=doc.source_version,
+                raw_span_end=block_span_end,
+                node_hash=block_node_hash,
             )
             if prev_block:
                 prev_block.next_id = block_node.node_id
@@ -659,8 +726,8 @@ def generate_doc(
             ordinal=chapter_index,
             ref_path=chapter_rel,
             is_leaf=False,
-            body_md=body_md,
-            body_plain=markdown_to_plain(body_md),
+            body_md="",
+            body_plain="",
             source_version=doc.source_version,
         )
         if prev_chapter:
@@ -674,6 +741,8 @@ def generate_doc(
                 section_id = f"section-{chapter_index:02d}-{sec_idx:02d}"
                 section_path = sections_root / chapter_id / f"{section_id}.md"
                 sec_body_md = "\n".join(sec_lines).strip() + "\n"
+                section_node_hash = stable_hash(sec_body_md)
+                section_span_end = max(1, len(sec_body_md))
                 write_text(
                     section_path,
                     _frontmatter(
@@ -702,9 +771,11 @@ def generate_doc(
                     ordinal=sec_idx,
                     ref_path=section_rel,
                     is_leaf=True,
-                    body_md=sec_body_md,
-                    body_plain=markdown_to_plain(sec_body_md),
+                    body_md="",
+                    body_plain="",
                     source_version=doc.source_version,
+                    raw_span_end=section_span_end,
+                    node_hash=section_node_hash,
                 )
                 if prev_section:
                     prev_section.next_id = section_node.node_id
@@ -714,15 +785,27 @@ def generate_doc(
                 wrote_articles = write_articles_and_items(section_node, sec_lines)
                 if wrote_articles:
                     section_node.is_leaf = False
+                    section_node.body_md = ""
+                    section_node.body_plain = ""
+                    section_node.raw_span_start = 0
+                    section_node.raw_span_end = 1
+                    section_node.node_hash = stable_hash("")
                 else:
                     wrote_blocks = write_blocks(section_node, sec_lines)
                     if wrote_blocks:
                         section_node.is_leaf = False
+                        section_node.body_md = ""
+                        section_node.body_plain = ""
+                        section_node.raw_span_start = 0
+                        section_node.raw_span_end = 1
+                        section_node.node_hash = stable_hash("")
                 section_count += 1
         else:
             section_id = f"section-{chapter_index:02d}-01"
             section_path = sections_root / chapter_id / f"{section_id}.md"
             sec_body_md = "\n".join(content_lines).strip() + "\n"
+            section_node_hash = stable_hash(sec_body_md)
+            section_span_end = max(1, len(sec_body_md))
             write_text(
                 section_path,
                 _frontmatter(
@@ -751,19 +834,31 @@ def generate_doc(
                 ordinal=1,
                 ref_path=section_rel,
                 is_leaf=True,
-                body_md=sec_body_md,
-                body_plain=markdown_to_plain(sec_body_md),
+                body_md="",
+                body_plain="",
                 source_version=doc.source_version,
+                raw_span_end=section_span_end,
+                node_hash=section_node_hash,
             )
             nodes.append(section_node)
 
             wrote_articles = write_articles_and_items(section_node, content_lines)
             if wrote_articles:
                 section_node.is_leaf = False
+                section_node.body_md = ""
+                section_node.body_plain = ""
+                section_node.raw_span_start = 0
+                section_node.raw_span_end = 1
+                section_node.node_hash = stable_hash("")
             else:
                 wrote_blocks = write_blocks(section_node, content_lines)
                 if wrote_blocks:
                     section_node.is_leaf = False
+                    section_node.body_md = ""
+                    section_node.body_plain = ""
+                    section_node.raw_span_start = 0
+                    section_node.raw_span_end = 1
+                    section_node.node_hash = stable_hash("")
             section_count = 1
         return chapter_id, section_count
 
@@ -877,11 +972,15 @@ def generate_doc_from_ir(
 
         node.ref_path = rel(path)
         body_md = node.body_md.rstrip() + "\n"
-        node.body_md = body_md
-        node.body_plain = markdown_to_plain(body_md)
+        node.body_plain = ""
 
         write_text(path, _render_kb_node_frontmatter(doc, node) + body_md)
         heading_rows.append((node.title, doc.doc_id, doc.title, kind, node.node_id, node.ref_path))
+
+        if node.is_leaf:
+            node.body_md = ""
+        else:
+            node.body_md = body_md
 
     toc_lines: List[str] = [
         f"# {doc.title} 目录\n\n",

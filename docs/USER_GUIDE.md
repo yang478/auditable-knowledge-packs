@@ -66,7 +66,7 @@ cd .claude/skills/my-books
 
 ## Bundle (recommended path)
 
-`bundle` performs **search → expand → budgeted rendering** and writes a single evidence file.
+`bundle` performs **deterministic iterative search (≤5 rounds) → expand → budgeted rendering** and writes a single evidence file.
 
 ```bash
 cd .claude/skills/my-books
@@ -75,12 +75,23 @@ cd .claude/skills/my-books
 # Or (binary): bin/<platform>/kbtool bundle --query "适用范围是什么？" --out bundle.md
 ```
 
+Audit note:
+- `bundle.md` includes a `## 检索轨迹` section that logs each retrieval round (tighten/relax actions) and the selected round.
+- No LLM calls are involved; only `query_mode` and `--must` constraints may be adjusted during the rounds to focus results to a few articles.
+- For safety, `--out` must point to a file path **within the skill root** (path traversal / absolute paths outside root are refused).
+
 Common options:
 - `--neighbors 1`: include previous/next leaf nodes under the same parent.
 - `--max-chars 40000`: total output budget.
 - `--per-node-max-chars 6000`: truncate a single node if it’s too long.
 - `--query-mode and|or`: compose the FTS query more strictly/loosely.
 - `--must TERM` (repeatable): terms that must appear (used as additional constraints).
+- `--timeout-ms 2000`: abort SQLite queries if they exceed this duration (0 = disabled).
+- Iterative retrieval knobs:
+  - `--iter-max-rounds 3`: cap iterative refinement rounds (1 = single-pass).
+  - `--iter-focus-max-articles 2`: try to converge to <= N articles.
+  - `--iter-mass-top3-threshold 0.9`: stricter convergence threshold.
+  - `--no-iter`: disable iterative refinement.
 - `--debug-triggers`: emit diagnostics and one-hop reference expansion.
 - `--enable-hooks`: enable runtime hooks from `hooks/` (see below).
 
@@ -105,6 +116,7 @@ Create `hooks/` under the generated skill root and add any of:
 - `hooks/pre_render.py`
 
 Each file must export `run(payload: dict) -> dict`. Hooks only run when you pass `--enable-hooks` to `search`/`bundle`.
+If `hooks/allowlist.sha1` exists, kbtool will only execute hooks whose sha1 is listed (one per line).
 
 ## Answering with provenance
 

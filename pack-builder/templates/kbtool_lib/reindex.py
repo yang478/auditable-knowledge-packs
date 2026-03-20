@@ -113,6 +113,8 @@ ALIAS_SOFT = "soft"
 def extract_alias_rows(nodes: Sequence[NodeRow]) -> List[AliasRow]:
     rows: set[AliasRow] = set()
     for node in nodes:
+        if not node.is_leaf:
+            continue
         core_title = core_alias_title(node.title)
         if core_title:
             normalized_title = normalize_alias_text(core_title)
@@ -186,6 +188,8 @@ def extract_reference_edges(nodes: Sequence[NodeRow]) -> List[EdgeRow]:
     }
     edges: set[EdgeRow] = set()
     for node in nodes:
+        if not node.is_leaf:
+            continue
         haystack = node.body_plain or node.body_md
         if not haystack:
             continue
@@ -417,6 +421,13 @@ def build_nodes_from_references(root: Path) -> Tuple[List[DocRow], List[NodeRow]
         for n in doc_nodes:
             if n.kind in {"chapter", "section"} and n.node_id in has_child:
                 n.is_leaf = False
+        for n in doc_nodes:
+            if not n.is_leaf:
+                n.body_md = ""
+                n.body_plain = ""
+                n.raw_span_start = 0
+                n.raw_span_end = 1
+                n.node_hash = stable_hash("")
 
         # Rebuild stable prev/next links for siblings when absent.
         by_group: Dict[Tuple[str, Optional[str], str], List[NodeRow]] = {}

@@ -5,10 +5,18 @@ import sqlite3
 import unicodedata
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Iterable, List, Sequence, Tuple, TypeVar
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 from .fs_utils import die
-from .text_utils import core_alias_title, fts_tokens, normalize_alias_text, normalize_article_ref, stable_hash
+from .text_utils import (
+    core_alias_title,
+    fts_tokens,
+    markdown_to_plain,
+    normalize_alias_text,
+    normalize_article_ref,
+    stable_hash,
+    strip_frontmatter,
+)
 from .types import AliasRecord, EdgeRecord, InputDoc, NodeRecord
 
 
@@ -22,9 +30,44 @@ ALIAS_ABBREVIATION = "abbreviation"
 ALIAS_SOFT = "soft"
 
 
-def extract_alias_rows(nodes: Sequence[NodeRecord]) -> List[AliasRecord]:
+def _safe_join_under(base_dir: Path, rel_path: str) -> Path:
+    base_resolved = base_dir.resolve()
+    path = (base_dir / rel_path).resolve()
+    try:
+        path.relative_to(base_resolved)
+    except ValueError:
+        die(f"Invalid ref_path outside build root: {rel_path!r}")
+    return path
+
+
+def _read_node_body_md_from_ref(base_dir: Path, node: NodeRecord) -> str:
+    if not node.ref_path:
+        die(f"Leaf node missing ref_path: node_id={node.node_id}")
+    path = _safe_join_under(base_dir, node.ref_path)
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        die(f"Failed to read node ref file: {path} (node_id={node.node_id}, {type(exc).__name__}: {exc})")
+    body = strip_frontmatter(raw)
+    return body.rstrip() + "\n"
+
+
+def _leaf_haystack_plain(base_dir: Optional[Path], node: NodeRecord) -> str:
+    if node.body_plain:
+        return node.body_plain
+    body_md = node.body_md
+    if not body_md and base_dir is not None:
+        body_md = _read_node_body_md_from_ref(base_dir, node)
+    if not body_md:
+        return ""
+    return markdown_to_plain(body_md)
+
+
+def extract_alias_rows(nodes: Sequence[NodeRecord], *, base_dir: Optional[Path] = None) -> List[AliasRecord]:
     rows: set[AliasRecord] = set()
     for node in nodes:
+        if not node.is_leaf:
+            continue
         core_title = core_alias_title(node.title)
         if not core_title:
             continue
@@ -79,7 +122,10 @@ def extract_alias_rows(nodes: Sequence[NodeRecord]) -> List[AliasRecord]:
                     )
                 )
 
-        for match in re.finditer(r'(?:简称|以下简称)[“"]?([^”"、，。；;]{2,12})[”"]?', node.body_plain):
+        haystack = _leaf_haystack_plain(base_dir, node)
+        if not haystack:
+            continue
+        for match in re.finditer(r'(?:简称|以下简称)[“"]?([^”"、，。；;]{2,12})[”"]?', haystack):
             alias = match.group(1).strip()
             normalized_alias = normalize_alias_text(alias)
             if normalized_alias:
@@ -102,7 +148,7 @@ def extract_alias_rows(nodes: Sequence[NodeRecord]) -> List[AliasRecord]:
     )
 
 
-def extract_reference_edges(nodes: Sequence[NodeRecord]) -> List[EdgeRecord]:
+def extract_reference_edges(nodes: Sequence[NodeRecord], *, base_dir: Optional[Path] = None) -> List[EdgeRecord]:
     article_targets = {
         (node.doc_id, normalize_article_ref(node.label)): node.node_id
         for node in nodes
@@ -110,7 +156,9 @@ def extract_reference_edges(nodes: Sequence[NodeRecord]) -> List[EdgeRecord]:
     }
     edges: set[EdgeRecord] = set()
     for node in nodes:
-        haystack = node.body_plain or node.body_md
+        if not node.is_leaf:
+            continue
+        haystack = _leaf_haystack_plain(base_dir, node)
         if not haystack:
             continue
         for pattern in _REFERENCE_PATTERNS:
@@ -139,6 +187,8 @@ def write_kb_sqlite_db(
     nodes: Sequence[NodeRecord],
     edges: Sequence[EdgeRecord],
     aliases: Sequence[AliasRecord],
+    *,
+    base_dir: Optional[Path] = None,
 ) -> None:
     if db_path.exists():
         db_path.unlink()
@@ -217,6 +267,11 @@ def write_kb_sqlite_db(
             """
         )
 
+        try:
+            conn.execute("CREATE VIRTUAL TABLE node_fts USING fts5(node_key UNINDEXED, tokens)")
+        except sqlite3.OperationalError as exc:
+            die(f"SQLite FTS5 is required but unavailable: {exc}")
+
         for d in docs:
             conn.execute(
                 """
@@ -228,6 +283,14 @@ def write_kb_sqlite_db(
             )
 
         for n in nodes:
+            body_md = n.body_md
+            if n.is_leaf and not body_md:
+                if base_dir is None:
+                    die(
+                        f"Missing body_md for leaf node and no base_dir provided: node_id={n.node_id} ref_path={n.ref_path!r}"
+                    )
+                body_md = _read_node_body_md_from_ref(base_dir, n)
+            body_plain = n.body_plain or markdown_to_plain(body_md)
             conn.execute(
                 """
                 INSERT INTO nodes(
@@ -258,8 +321,11 @@ def write_kb_sqlite_db(
             )
             conn.execute(
                 "INSERT INTO node_text(node_key, body_md, body_plain) VALUES (?,?,?)",
-                (n.node_key, n.body_md, n.body_plain),
+                (n.node_key, body_md, body_plain),
             )
+            if n.is_leaf:
+                tokens = fts_tokens(n.title + "\n" + body_plain)
+                conn.execute("INSERT INTO node_fts(node_key, tokens) VALUES (?,?)", (n.node_key, tokens))
 
         for e in edges:
             conn.execute(
@@ -296,17 +362,6 @@ def write_kb_sqlite_db(
                     a.source,
                 ),
             )
-
-        try:
-            conn.execute("CREATE VIRTUAL TABLE node_fts USING fts5(node_key UNINDEXED, tokens)")
-        except sqlite3.OperationalError as exc:
-            die(f"SQLite FTS5 is required but unavailable: {exc}")
-
-        for n in nodes:
-            if not n.is_leaf:
-                continue
-            tokens = fts_tokens(n.title + "\n" + n.body_plain)
-            conn.execute("INSERT INTO node_fts(node_key, tokens) VALUES (?,?)", (n.node_key, tokens))
 
         conn.execute("CREATE INDEX idx_nodes_doc_id_active ON nodes(doc_id, is_active)")
         conn.execute("CREATE INDEX idx_nodes_node_id_active ON nodes(node_id, is_active)")
@@ -469,4 +524,3 @@ def merge_history(
             continue
         merged.append(replace(record, is_active=False))  # type: ignore[arg-type]
     return sorted(merged, key=sort_key)
-
