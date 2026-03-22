@@ -4,14 +4,16 @@
 
 面向法规/制度/合规与 SOP/手册：生成**可审计、可复现、强出处**的证据包（**不使用向量/embedding**）。
 
-把一份或多份文档（Markdown/TXT/DOCX/可读 PDF）离线生成一个**确定性、非向量**的“知识库 Skill”。在线查询时，不让 LLM 自己“检索 → 打开文件 → 拼上下文 → 写引用”，而是通过确定性 CLI 输出单一证据文件 `bundle.md`（强制携带来源清单）。
+把一份或多份文档（Markdown/TXT/DOCX/可读 PDF）离线生成一个**确定性、非向量**的“知识库 Skill”。在线查询时，不让 LLM 自己“检索 → 打开文件 → 拼上下文 → 写引用”，而是通过确定性 CLI 产出可审计的证据包 `bundle.roundNN.md`（强制携带来源清单），并同时生成机器可读的 trace/verify 产物。
 
 ## 产出内容
 
 - `references/`：可人工审计的 Markdown 文件树（章/节/条/块）
 - `kb.sqlite`：SQLite + FTS5 索引（中文 CJK 2-gram + 英文/数字词；无需向量库）
 - `kbtool` / `kbtool.cmd`：根目录入口（优先匹配当前平台 fresh binary，回退到 Python）
-- `scripts/kbtool.py` + `scripts/kbtool_lib/`：确定性的 `search`/`bundle`/`reindex` 命令，把 query 变成一个 `bundle.md`（并附带指向 `references/` 的来源清单）
+- `scripts/kbtool.py` + `scripts/kbtool_lib/`：确定性的 `search`/`research`/`reindex` 命令；其中 `research` 会写出：
+  - `run_dir/bundle.roundNN.md`（证据 + 引用 + 回答约束）
+  - `run_dir/trace.roundNN.json` + `run_dir/verify.roundNN.json`，并追加 `run_dir/trace.jsonl`
 - `bin/<platform>/kbtool(.exe)`：可选（PyInstaller）单文件二进制（需按平台分别构建）
 
 ## 为什么要这样设计（审计优先）
@@ -19,7 +21,7 @@
 在合规/制度/SOP 场景里，关键风险往往不是“召回差一点”，而是“出处说不清 / 复现不一致 / 证据链不稳定”。
 
 如果让 LLM 自己去做“检索 → 打开文件 → 拼上下文 → 写引用”，不同模型/不同提示词的结果差异很大，而且很容易丢来源。
-本项目把关键路径脚本化，保证**可重复、可追溯**：模型只需要阅读 `bundle.md` 就能稳定回答。
+本项目把关键路径脚本化，保证**可重复、可追溯**：模型只需要阅读 `bundle.roundNN.md` 就能稳定回答（并且不得编造 bundle 中不存在的公式/文本）。
 
 它主要优化：
 
@@ -32,7 +34,7 @@
 
 - **向量/embedding-first 框架**（LangChain/LlamaIndex/RAGFlow 等）擅长语义召回，但需要 embedding 模型 + 向量库；而且当模型、切分策略或 embedding 变化时，引用稳定性更容易漂移。
 - **让模型自己翻文件并写引用**更灵活，但很难复现；不同提示词/不同模型下的证据链一致性也难保证。
-- **纯关键词检索**（grep/Elasticsearch/SQLite FTS）擅长“找字符串”，但仍缺少一个确定性、结构感知的上下文拼装器；`kbtool bundle` 通过 rerank + 扩展 + 按预算渲染，把结果稳定收敛到单一证据文件。
+- **纯关键词检索**（grep/Elasticsearch/SQLite FTS）擅长“找字符串”，但仍缺少一个确定性、结构感知的上下文拼装器；`kbtool research` 会跑一轮确定性检索+渲染，并产出可审计的证据包与 trace/verify 报告。
 
 如果你更需要“强语义改写/同义转述”的匹配，混合检索（关键词 + 向量）通常更合适；如果你更需要稳定证据包与可追溯来源，本项目就是为此设计的。
 
@@ -46,7 +48,7 @@
 
 ```text
 文档输入 ──(build_skill.py)──> references/ + kb.sqlite
-提出问题 ──(kbtool bundle)────> bundle.md（证据 + 引用）
+提出问题 ──(kbtool research)──> run_dir/bundle.roundNN.md（+ trace/verify）
 ```
 
 ## 快速开始
@@ -68,14 +70,18 @@ python3 pack-builder/scripts/build_skill.py \
 
 输出目录：`.claude/skills/my-books/`
 
-### 生成确定性的证据包（bundle）
+### 生成确定性的证据包（research，推荐）
 
 ```bash
 cd .claude/skills/my-books
-./kbtool bundle --query "适用范围是什么？" --out bundle.md
+./kbtool research \
+  --query "适用范围是什么？" \
+  --run-dir research_runs/case-001 \
+  --planner-json '{"model":"gpt-5","temperature":0.2,"prompt_sha256":"..."}'
 ```
 
-打开 `bundle.md`，基于其中内容回答（并复制底部自动生成的“参考依据/来源清单”）。
+打开 `research_runs/case-001/bundle.round01.md`，基于其中内容回答（并复制底部自动生成的 `## 参考依据`）。
+如 `verify.round01.json` 未通过（`ok=false`），修改 query/参数后继续在同一 `--run-dir` 跑下一轮（round 自动递增）。
 
 ## 文档
 

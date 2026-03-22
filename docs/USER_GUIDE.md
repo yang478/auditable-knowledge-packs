@@ -1,6 +1,6 @@
 # User Guide
 
-This guide explains how to generate a knowledge-base skill from documents, and how to use the generated deterministic retrieval (`search`/`bundle`) workflow.
+This guide explains how to generate a knowledge-base skill from documents, and how to use the generated deterministic retrieval (`search`/`research`) workflow.
 
 ## Concepts
 
@@ -10,7 +10,10 @@ This guide explains how to generate a knowledge-base skill from documents, and h
   - `kbtool` / `kbtool.cmd`: recommended entrypoints (prefer a fresh matching binary, fall back to Python)
   - `scripts/kbtool.py` + `scripts/kbtool_lib/`: deterministic CLI implementation used at query time
   - (Optional) `bin/<platform>/kbtool(.exe)`: PyInstaller packaged single-file executable (no Python required)
-- **Deterministic bundle**: instead of letting an LLM assemble context itself, you run `kbtool bundle` to produce a single `bundle.md` that includes evidence plus forced provenance.
+- **Deterministic research round**: instead of letting an LLM assemble context itself, you run `kbtool research` to produce:
+  - `run_dir/bundle.roundNN.md` (evidence + citations + answering constraints)
+  - `run_dir/trace.roundNN.json` + `run_dir/verify.roundNN.json` + append-only `run_dir/trace.jsonl`
+  - stdout JSON for the LLM to decide the *next* round query/params
 
 ## Requirements
 
@@ -64,28 +67,36 @@ cd .claude/skills/my-books
 # Or (binary): bin/<platform>/kbtool search --query "质量保证期限" --out search.md
 ```
 
-## Bundle (recommended path)
+## Research (recommended path)
 
-`bundle` performs **deterministic iterative search (≤5 rounds) → expand → budgeted rendering** and writes a single evidence file.
+`research` performs **deterministic iterative search (≤5 rounds) → expand → budgeted rendering → verify** and writes one round of auditable artifacts.
 
 ```bash
 cd .claude/skills/my-books
-./kbtool bundle --query "适用范围是什么？" --out bundle.md
-# Or (python): python3 scripts/kbtool.py bundle --query "适用范围是什么？" --out bundle.md
-# Or (binary): bin/<platform>/kbtool bundle --query "适用范围是什么？" --out bundle.md
+./kbtool research \
+  --query "适用范围是什么？" \
+  --run-dir research_runs/case-001 \
+  --planner-json '{"model":"gpt-5","temperature":0.2,"prompt_sha256":"..."}'
+# Or (python): python3 scripts/kbtool.py research --query "..." --run-dir research_runs/case-001 --planner-json '{...}'
+# Or (binary): bin/<platform>/kbtool research --query "..." --run-dir research_runs/case-001 --planner-json '{...}'
 ```
 
 Audit note:
-- `bundle.md` includes a `## 检索轨迹` section that logs each retrieval round (tighten/relax actions) and the selected round.
-- No LLM calls are involved; only `query_mode` and `--must` constraints may be adjusted during the rounds to focus results to a few articles.
-- For safety, `--out` must point to a file path **within the skill root** (path traversal / absolute paths outside root are refused).
+- `bundle.roundNN.md` includes a `## 检索轨迹` section (and an “Evidence-only” contract at the top).
+- No LLM calls are involved in retrieval; the LLM only decides whether to run the *next* round and what params to use.
+- `--planner-json` is part of the audit trail. Minimum recommended keys: `{model, temperature, prompt_sha256}` (or use `prompt_path`).
+  - If you provide `prompt_path` (file) or `prompt` (string) in `planner-json`, kbtool will copy the prompt into `run_dir/` and compute `prompt_sha256`.
+- For safety, `--run-dir` must be within the skill root (path traversal / absolute paths outside root are refused).
 
 Common options:
+- `--run-dir research_runs/case-001`: where round artifacts are written.
+- `--round 0`: 0 = auto-increment (recommended); set a number to force.
+- `--note "..."`: free-form note stored in trace.
 - `--neighbors 1`: include previous/next leaf nodes under the same parent.
 - `--max-chars 40000`: total output budget.
 - `--per-node-max-chars 6000`: truncate a single node if it’s too long.
 - `--query-mode and|or`: compose the FTS query more strictly/loosely.
-- `--must TERM` (repeatable): terms that must appear (used as additional constraints).
+- `--must TERM` (repeatable): terms that must appear (used as additional constraints). If a term looks like a doc code and matches a `doc_id`, it is treated as a doc hint (filters/prioritizes that document) instead of a “text must appear” constraint.
 - `--timeout-ms 2000`: abort SQLite queries if they exceed this duration (0 = disabled).
 - Iterative retrieval knobs:
   - `--iter-max-rounds 3`: cap iterative refinement rounds (1 = single-pass).
@@ -94,6 +105,8 @@ Common options:
   - `--no-iter`: disable iterative refinement.
 - `--debug-triggers`: emit diagnostics and one-hop reference expansion.
 - `--enable-hooks`: enable runtime hooks from `hooks/` (see below).
+
+If verify fails (`ok=false` in stdout JSON), revise query/params and run the NEXT round in the same `--run-dir` (omit `--round` to auto-increment). `verify.roundNN.json` includes `suggested_next_params` to help automation.
 
 ## Atomic commands (JSON output)
 
@@ -115,12 +128,12 @@ Create `hooks/` under the generated skill root and add any of:
 - `hooks/pre_expand.py`
 - `hooks/pre_render.py`
 
-Each file must export `run(payload: dict) -> dict`. Hooks only run when you pass `--enable-hooks` to `search`/`bundle`.
+Each file must export `run(payload: dict) -> dict`. Hooks only run when you pass `--enable-hooks` to `search`/`research`.
 If `hooks/allowlist.sha1` exists, kbtool will only execute hooks whose sha1 is listed (one per line).
 
 ## Answering with provenance
 
-Open `bundle.md` and answer **only** based on its contents.
+Open `bundle.roundNN.md` and answer **only** based on its contents.
 
 At the bottom, the tool appends a references section (paths into `references/`). Keep it when you quote or summarize content.
 

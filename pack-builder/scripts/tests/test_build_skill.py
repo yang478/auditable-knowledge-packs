@@ -339,6 +339,53 @@ class BuildSkillTests(unittest.TestCase):
             self.assertIn("infectious-a", infectious_md)
             self.assertIn("infectious-b", infectious_md)
 
+    def test_build_structured_outline_clause_and_table_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "eurocode_outline.md")
+            doc_id = "eurocode-outline"
+
+            report_path = generated / "references" / doc_id / "structure_report.json"
+            self.assertTrue(report_path.exists())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["outline"]["mode"], "outline")
+
+            db_path = generated / "kb.sqlite"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                clause_id = f"{doc_id}:clause:2.4.2.4"
+                table_id = f"{doc_id}:table:2.1N"
+
+                clause = conn.execute(
+                    "SELECT node_id, kind, is_leaf FROM nodes WHERE node_id = ? AND is_active = 1 ORDER BY source_version DESC LIMIT 1",
+                    (clause_id,),
+                ).fetchone()
+                self.assertIsNotNone(clause)
+                self.assertEqual(str(clause["kind"]), "clause")
+                self.assertEqual(int(clause["is_leaf"]), 1)
+
+                table = conn.execute(
+                    "SELECT node_id, kind, parent_id, is_leaf FROM nodes WHERE node_id = ? AND is_active = 1 ORDER BY source_version DESC LIMIT 1",
+                    (table_id,),
+                ).fetchone()
+                self.assertIsNotNone(table)
+                self.assertEqual(str(table["kind"]), "table")
+                self.assertEqual(str(table["parent_id"]), clause_id)
+                self.assertEqual(int(table["is_leaf"]), 1)
+            finally:
+                conn.close()
+
+            clause_path = generated / "references" / doc_id / "outline" / "clauses" / "clause-2.4.2.4.md"
+            self.assertTrue(clause_path.exists())
+            clause_md = clause_path.read_text(encoding="utf-8")
+            self.assertIn("[Extracted table 2.1N]", clause_md)
+            self.assertNotIn("Design situations", clause_md)
+
+            bundle = run_bundle(generated, query="Partial factors for materials")
+            self.assertIn("table:2.1N", bundle)
+            self.assertIn("Design situations", bundle)
+
     def test_skill_md_omits_full_doc_list_when_over_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1041,7 +1088,7 @@ class BuildSkillTests(unittest.TestCase):
             skill_md = (generated / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("TL;DR (LLM/Agent)", skill_md)
             self.assertIn("./kbtool --skill", skill_md)
-            self.assertIn("./kbtool bundle --query", skill_md)
+            self.assertIn("./kbtool research --query", skill_md)
             self.assertIn("## 参考依据", skill_md)
             self.assertIn("不要直接调用 `scripts/` 或 `bin/`", skill_md)
 
@@ -2305,13 +2352,53 @@ class BuildSkillTests(unittest.TestCase):
             self.assertEqual(data.get("skill", {}).get("name"), "my-books")
             self.assertIn("commands", data)
             cmd_names = {c.get("name") for c in data.get("commands", []) if isinstance(c, dict)}
-            self.assertIn("bundle", cmd_names)
+            self.assertNotIn("bundle", cmd_names)
+            self.assertIn("research", cmd_names)
             self.assertIn("search", cmd_names)
             self.assertIn("get-node", cmd_names)
             self.assertIn("get-children", cmd_names)
             self.assertIn("get-parent", cmd_names)
             self.assertIn("get-siblings", cmd_names)
             self.assertIn("follow-references", cmd_names)
+
+    def test_kbtool_research_writes_round_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            generated = build_retrieval_skill(tmp_path, "standard_v1.md", "handbook.md")
+
+            run_dir = "research_runs/test-run"
+            data = run_kbtool_json(
+                generated,
+                [
+                    "research",
+                    "--query",
+                    "适用范围是什么？",
+                    "--run-dir",
+                    run_dir,
+                ],
+            )
+            self.assertEqual(data.get("cmd"), "research")
+            self.assertEqual(data.get("round"), 1)
+            self.assertEqual(data.get("run_dir"), run_dir)
+            self.assertIn("paths", data)
+            self.assertIn("bundle_md", data.get("paths", {}))
+            self.assertIn("trace_json", data.get("paths", {}))
+            self.assertIn("verify_json", data.get("paths", {}))
+            self.assertIn("trace_jsonl", data.get("paths", {}))
+
+            bundle_path = generated / str(data["paths"]["bundle_md"])
+            trace_path = generated / str(data["paths"]["trace_json"])
+            verify_path = generated / str(data["paths"]["verify_json"])
+            trace_jsonl_path = generated / str(data["paths"]["trace_jsonl"])
+
+            self.assertTrue(bundle_path.exists())
+            self.assertTrue(trace_path.exists())
+            self.assertTrue(verify_path.exists())
+            self.assertTrue(trace_jsonl_path.exists())
+
+            verify = json.loads(verify_path.read_text(encoding="utf-8"))
+            self.assertIsInstance(verify, dict)
+            self.assertEqual(verify.get("schema"), "kbtool.verify.v1")
 
     def test_kbtool_atomic_commands_return_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

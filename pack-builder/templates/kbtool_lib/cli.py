@@ -14,6 +14,7 @@ from .retrieval import (
     cmd_get_children,
     cmd_get_node,
     cmd_get_parent,
+    cmd_research,
     cmd_get_siblings,
     cmd_search,
 )
@@ -54,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Abort SQLite queries if they exceed this duration in ms (0 = disabled).",
     )
     b.add_argument("--no-iter", action="store_true", help="Disable iterative retrieval (single-pass search).")
-    b.add_argument("--neighbors", type=int, default=1, help="Expand to prev/next leaf nodes within same parent.")
+    b.add_argument("--neighbors", type=int, default=0, help="Expand to prev/next leaf nodes within same parent.")
     b.add_argument("--order", choices=["relevance", "chronological"], default="relevance", help="Output order.")
     b.add_argument("--max-chars", type=int, default=40000, help="Max output size (characters).")
     b.add_argument("--per-node-max-chars", type=int, default=6000, help="Max chars per node before truncation.")
@@ -62,6 +63,49 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--debug-triggers", action="store_true", help="Emit reference-trigger diagnostics and one-hop reference expansion.")
     b.add_argument("--enable-hooks", action="store_true", help="Enable optional hooks from hooks/ directory (executes local python).")
     b.set_defaults(func=cmd_bundle)
+
+    rr = sub.add_parser("research", help="Run ONE research round: bundle + verify + structured trace outputs (LLM-in-the-loop).")
+    rr.add_argument("--query", required=True, help="User query.")
+    rr.add_argument("--run-dir", default="", help="Run output directory (relative to root). If empty, a new run dir is created.")
+    rr.add_argument("--round", type=int, default=0, help="Round number (0 = auto-increment based on existing bundle.roundNN.md).")
+    rr.add_argument(
+        "--planner-json",
+        default="",
+        help="Planner metadata JSON (audit). Recommended keys: model, temperature, prompt_sha256 (or prompt_path). Saved into trace.",
+    )
+    rr.add_argument("--note", default="", help="Optional note saved into trace (free-form text).")
+    rr.add_argument("--limit", type=int, default=20, help="Max FTS candidates to consider.")
+    rr.add_argument("--query-mode", choices=["or", "and"], default="or", help="FTS query composition mode.")
+    rr.add_argument("--must", action="append", default=[], help="Term that must appear (repeatable).")
+    rr.add_argument("--iter-max-rounds", type=int, default=5, help="Iterative retrieval rounds (1-5, default: 5).")
+    rr.add_argument("--iter-focus-k", type=int, default=12, help="Top-K hits used for focus metrics (default: 12).")
+    rr.add_argument(
+        "--iter-focus-max-articles",
+        type=int,
+        default=3,
+        help="Try to converge to <= N articles (default: 3).",
+    )
+    rr.add_argument(
+        "--iter-mass-top3-threshold",
+        type=float,
+        default=0.8,
+        help="Converged when top3 article mass >= T (0-1, default: 0.8).",
+    )
+    rr.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=0,
+        help="Abort SQLite queries if they exceed this duration in ms (0 = disabled).",
+    )
+    rr.add_argument("--no-iter", action="store_true", help="Disable iterative retrieval (single-pass search).")
+    rr.add_argument("--neighbors", type=int, default=0, help="Expand to prev/next leaf nodes within same parent.")
+    rr.add_argument("--order", choices=["relevance", "chronological"], default="relevance", help="Output order.")
+    rr.add_argument("--max-chars", type=int, default=40000, help="Max output size (characters).")
+    rr.add_argument("--per-node-max-chars", type=int, default=6000, help="Max chars per node before truncation.")
+    rr.add_argument("--body", choices=["full", "snippet", "none"], default="full", help="Leaf body rendering mode.")
+    rr.add_argument("--debug-triggers", action="store_true", help="Emit reference-trigger diagnostics and one-hop reference expansion.")
+    rr.add_argument("--enable-hooks", action="store_true", help="Enable optional hooks from hooks/ directory (executes local python).")
+    rr.set_defaults(func=cmd_research)
 
     s = sub.add_parser("search", help="Search leaf nodes and write ranked hits with snippets.")
     s.add_argument("--query", required=True, help="User query.")
@@ -80,7 +124,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_search)
 
     gn = sub.add_parser("get-node", help="Get one node as JSON.")
-    gn.add_argument("node_id", help="Node ID to fetch.")
+    gn.add_argument("node_id", nargs="?", default="", help="Node ID to fetch.")
+    gn.add_argument("--node-id", dest="node_id_flag", default="", help="Node ID to fetch (same as positional).")
+    gn.add_argument("--out", default="", help="Optional JSON output path (relative to root).")
     gn.set_defaults(func=cmd_get_node)
 
     gc = sub.add_parser("get-children", help="List children of a node as JSON.")
@@ -143,22 +189,84 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "tool": "kbtool",
                 "deterministic": True,
                 "skill": {"name": skill_name, "title": title, "docs": doc_count},
+                "contracts": {
+                    "answering": [
+                        "Evidence-only: only cite clauses/equations/quotes that appear in bundle.roundNN.md.",
+                        "Never invent formulas/numbers from memory. If an equation is missing/blank, cite only its number (e.g. (6.xx)) and state extraction is missing.",
+                        "Include the auto-generated '## 参考依据' section at the end of your answer.",
+                    ],
+                    "planner_json": {
+                        "minimum": {
+                            "model": "string",
+                            "temperature": "number",
+                            "prompt_sha256": "sha256 hex (or use prompt_path)",
+                        },
+                        "prompt_path": "Optional: path to a text file containing the planner prompt; kbtool will copy+hash it into run_dir.",
+                    },
+                },
                 "commands": [
                     {
-                        "name": "bundle",
-                        "description": "Search + expand + write evidence bundle markdown.",
+                        "name": "research",
+                        "description": "Run ONE round: bundle + verify + write structured trace for iterative deep research (LLM decides next round).",
                         "options": [
+                            {"flag": "--run-dir", "type": "string", "default": "", "note": "Empty = create new run dir"},
+                            {"flag": "--round", "type": "int", "default": 0, "note": "0 = auto-increment"},
+                            {
+                                "flag": "--planner-json",
+                                "type": "string",
+                                "default": "",
+                                "note": "Planner metadata JSON (audit). Include at least: {model, temperature, prompt_sha256 or prompt_path}.",
+                            },
+                            {"flag": "--note", "type": "string", "default": ""},
+                            {"flag": "--query-mode", "type": "enum", "choices": ["or", "and"], "default": "or"},
+                            {
+                                "flag": "--must",
+                                "type": "string",
+                                "default": [],
+                                "repeatable": True,
+                                "note": "Usually 'text must appear'. Doc-code-like terms (e.g. 1993-1-1) are treated as doc hints when they match a doc_id.",
+                            },
+                            {"flag": "--limit", "type": "int", "default": 20},
                             {"flag": "--iter-max-rounds", "type": "int", "default": 5, "range": [1, 5]},
                             {"flag": "--iter-focus-max-articles", "type": "int", "default": 3},
                             {"flag": "--iter-mass-top3-threshold", "type": "float", "default": 0.8, "range": [0.0, 1.0]},
                             {"flag": "--timeout-ms", "type": "int", "default": 0, "note": "0 = disabled"},
                             {"flag": "--no-iter", "type": "bool", "default": False},
+                            {"flag": "--neighbors", "type": "int", "default": 0},
+                            {"flag": "--order", "type": "enum", "choices": ["relevance", "chronological"], "default": "relevance"},
+                            {"flag": "--max-chars", "type": "int", "default": 40000},
+                            {"flag": "--per-node-max-chars", "type": "int", "default": 6000},
+                            {"flag": "--body", "type": "enum", "choices": ["full", "snippet", "none"], "default": "full"},
+                            {"flag": "--debug-triggers", "type": "bool", "default": False},
+                            {"flag": "--enable-hooks", "type": "bool", "default": False},
+                        ],
+                        "outputs": [
+                            "Writes run_dir/bundle.roundNN.md",
+                            "Writes run_dir/trace.roundNN.json",
+                            "Writes run_dir/verify.roundNN.json",
+                            "Appends run_dir/trace.jsonl",
+                            "Prints a JSON summary to stdout",
                         ],
                     },
                     {
                         "name": "search",
                         "description": "Search leaf nodes and write ranked hits markdown.",
-                        "options": [{"flag": "--timeout-ms", "type": "int", "default": 0, "note": "0 = disabled"}],
+                        "options": [
+                            {"flag": "--query", "type": "string", "required": True},
+                            {"flag": "--out", "type": "string", "default": "search.md"},
+                            {"flag": "--query-mode", "type": "enum", "choices": ["or", "and"], "default": "or"},
+                            {
+                                "flag": "--must",
+                                "type": "string",
+                                "default": [],
+                                "repeatable": True,
+                                "note": "Usually 'text must appear'. Doc-code-like terms (e.g. 1993-1-1) are treated as doc hints when they match a doc_id.",
+                            },
+                            {"flag": "--limit", "type": "int", "default": 20},
+                            {"flag": "--snippet-chars", "type": "int", "default": 280},
+                            {"flag": "--timeout-ms", "type": "int", "default": 0, "note": "0 = disabled"},
+                            {"flag": "--enable-hooks", "type": "bool", "default": False},
+                        ],
                     },
                     {"name": "get-node", "description": "Fetch a node as JSON (includes body_md)."},
                     {"name": "get-children", "description": "List children of a node as JSON."},
@@ -170,9 +278,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     {"name": "reindex", "description": "Rebuild kb.sqlite from references/."},
                 ],
                 "workflow": [
-                    "Prefer `bundle --query ...` to generate auditable evidence.",
-                    "Answer strictly from bundle.md contents.",
-                    "Append the `## 参考依据` section to your final answer.",
+                    "Prefer `research --query ...` to generate auditable evidence + verify + trace (one round).",
+                    "If verify fails, revise query/params and run the NEXT `research` round (same `--run-dir`, omit `--round` so it auto-increments).",
+                    "Answer strictly from the generated bundle.roundNN.md and append its `## 参考依据` section.",
                 ],
                 "security": {
                     "hooks": {

@@ -60,6 +60,35 @@ def _extract_pdf_to_text(path: Path, *, pdf_fallback: str) -> str:
     return proc.stdout
 
 
+def _docx_image_relationships(docx_path: Path) -> dict[str, str]:
+    try:
+        with zipfile.ZipFile(docx_path) as z:
+            try:
+                rels_xml = z.read("word/_rels/document.xml.rels")
+            except KeyError:
+                return {}
+    except zipfile.BadZipFile:
+        return {}
+
+    try:
+        root = ET.fromstring(rels_xml)
+    except ET.ParseError:
+        return {}
+
+    ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+    out: dict[str, str] = {}
+    for rel in root.findall("r:Relationship", ns):
+        rid = rel.attrib.get("Id") or ""
+        typ = rel.attrib.get("Type") or ""
+        target = rel.attrib.get("Target") or ""
+        if not rid or not target:
+            continue
+        if "relationships/image" not in typ:
+            continue
+        out[rid] = target
+    return out
+
+
 def _docx_paragraphs(docx_path: Path) -> List[Tuple[Optional[int], str]]:
     try:
         with zipfile.ZipFile(docx_path) as z:
@@ -73,7 +102,12 @@ def _docx_paragraphs(docx_path: Path) -> List[Tuple[Optional[int], str]]:
         root = ET.fromstring(xml)
     except ET.ParseError:
         die(f"DOCX parse failed: {docx_path.name}. Try converting DOCX → MD/TXT first.")
-    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    ns = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+    img_rels = _docx_image_relationships(docx_path)
     paras: List[Tuple[Optional[int], str]] = []
 
     for p in root.findall(".//w:p", ns):
@@ -84,10 +118,24 @@ def _docx_paragraphs(docx_path: Path) -> List[Tuple[Optional[int], str]]:
             if pstyle is not None:
                 style_val = pstyle.attrib.get(f"{{{ns['w']}}}val")
 
-        runs: List[str] = []
-        for t in p.findall(".//w:t", ns):
-            runs.append(t.text or "")
-        text = "".join(runs).strip()
+        text_only = "".join((t.text or "") for t in p.findall(".//w:t", ns)).strip()
+        if not text_only:
+            continue
+
+        include_images = bool(re.search(r"\(\d+(?:\.\d+)+\)", text_only))
+        if not include_images:
+            text = text_only
+        else:
+            parts: List[str] = []
+            for r_el in p.findall("./w:r", ns):
+                parts.append("".join((t.text or "") for t in r_el.findall(".//w:t", ns)))
+                for blip in r_el.findall(".//a:blip", ns):
+                    embed = blip.attrib.get(f"{{{ns['r']}}}embed") or ""
+                    if not embed:
+                        continue
+                    target = img_rels.get(embed) or embed
+                    parts.append(f" [[IMAGE:{target}]] ")
+            text = "".join(parts).strip()
         if not text:
             continue
 

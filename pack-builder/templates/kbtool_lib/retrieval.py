@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sqlite3
+import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -373,6 +377,31 @@ def iter_neighbors(conn: sqlite3.Connection, node: Node, neighbors: int) -> List
     return out
 
 
+def _doc_id_from_node_id(node_id: str) -> str:
+    # node_id format: "{doc_id}:{kind}:{label...}"
+    return str(node_id).split(":", 1)[0]
+
+
+_DOC_CODE_HINT_RE = re.compile(r"(?<!\d)([1-9]\d{3}(?:-\d+){1,4})(?!\d)")
+
+
+def extract_doc_code_hints(raw_query: str) -> List[str]:
+    hints: List[str] = []
+    seen: set[str] = set()
+    for m in _DOC_CODE_HINT_RE.finditer(str(raw_query or "")):
+        code = str(m.group(1) or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        hints.append(code)
+    return hints
+
+
+def _compile_doc_code_hint_re(code: str) -> re.Pattern[str]:
+    # Avoid prefix matches like "1993-1-1" matching "1993-1-12".
+    return re.compile(rf"(?<!\d){re.escape(str(code or '').strip())}(?!\d)")
+
+
 def search_leaf_nodes(
     conn: sqlite3.Connection,
     raw_query: str,
@@ -381,6 +410,39 @@ def search_leaf_nodes(
     query_mode: str = "or",
     must_terms: Sequence[str] = (),
 ) -> List[str]:
+    raw_must_terms = [str(t).strip() for t in must_terms if str(t).strip()]
+    must_content_terms: List[str] = []
+    must_doc_code_hints: List[str] = []
+    hinted_terms: List[Tuple[str, List[str]]] = []
+    candidate_doc_hints: List[str] = []
+    for t in raw_must_terms:
+        hints = extract_doc_code_hints(t)
+        if not hints:
+            must_content_terms.append(t)
+            continue
+        hinted_terms.append((t, hints))
+        for h in hints:
+            if h and h not in candidate_doc_hints:
+                candidate_doc_hints.append(h)
+
+    if hinted_terms and candidate_doc_hints:
+        doc_ids = [
+            str(row[0])
+            for row in conn.execute("SELECT DISTINCT doc_id FROM nodes WHERE is_active = 1").fetchall()
+        ]
+        matched: set[str] = set()
+        for h in candidate_doc_hints:
+            r = _compile_doc_code_hint_re(h)
+            if any(r.search(doc_id) for doc_id in doc_ids):
+                matched.add(h)
+        for t, hints in hinted_terms:
+            if any(h in matched for h in hints):
+                for h in hints:
+                    if h in matched and h not in must_doc_code_hints:
+                        must_doc_code_hints.append(h)
+            else:
+                must_content_terms.append(t)
+
     normalized_query = normalize_query(raw_query)
     title_hits = search_title_nodes(conn, normalized_query, limit=limit)
     body_hits = search_body_nodes(
@@ -388,8 +450,13 @@ def search_leaf_nodes(
         normalized_query,
         limit=limit,
         query_mode=query_mode,
-        must_terms=must_terms,
+        must_terms=must_content_terms,
     )
+    doc_code_hints = extract_doc_code_hints(raw_query)
+    for h in must_doc_code_hints:
+        if h and h not in doc_code_hints:
+            doc_code_hints.append(h)
+    doc_code_hint_res = [_compile_doc_code_hint_re(c) for c in doc_code_hints if str(c).strip()]
     alias_hits: List[str] = []
     seen_alias_hits: set[str] = set()
     for term in normalized_query.alias_terms:
@@ -407,6 +474,17 @@ def search_leaf_nodes(
     ordered_scores: List[Tuple[int, int, int, str]] = []
     seen_nodes: set[str] = set()
     has_primary_support = bool(title_hits or alias_hits)
+    query_low = str(raw_query or "").lower()
+    boilerplate_titles = {
+        "preface",
+        "foreword",
+        "contents",
+        "table of contents",
+        "toc",
+        "前言",
+        "目录",
+    }
+    boilerplate_query_terms = {"preface", "foreword", "contents", "table of contents", "toc", "前言", "目录"}
     for node_id in combined:
         if node_id in seen_nodes:
             continue
@@ -418,15 +496,43 @@ def search_leaf_nodes(
             and node_id not in alias_rank
         ):
             continue
-        if must_terms or query_mode == "and":
+        downrank_boilerplate = False
+        node_kind = ""
+        node_title_low = ""
+        if must_content_terms or query_mode == "and":
             node = get_node(conn, node_id)
+            node_kind = str(node.kind or "")
+            node_title_low = str(node.title or "").strip().lower()
             hay = (node.title + "\n" + node.body_plain).lower()
-            if any(str(t).lower() not in hay for t in must_terms if str(t).strip()):
+            if any(str(t).lower() not in hay for t in must_content_terms if str(t).strip()):
                 continue
             if query_mode == "and":
                 parts = [p.lower() for p in query_terms(raw_query) if p.strip()]
                 if any(p not in hay for p in parts):
                     continue
+        else:
+            row = conn.execute(
+                """
+                SELECT kind, title
+                FROM nodes
+                WHERE node_id = ? AND is_active = 1
+                ORDER BY source_version DESC
+                LIMIT 1
+                """,
+                (node_id,),
+            ).fetchone()
+            if row:
+                node_kind = str(row["kind"] or "")
+                node_title_low = str(row["title"] or "").strip().lower()
+
+        if (
+            node_kind == "block"
+            and node_title_low in boilerplate_titles
+            and not any(t in query_low for t in boilerplate_query_terms)
+        ):
+            downrank_boilerplate = True
+        if downrank_boilerplate:
+            continue
         score = 0
         if node_id in title_rank:
             score += 3000 - title_rank[node_id]
@@ -438,6 +544,10 @@ def search_leaf_nodes(
             score += 250
         if node_id in alias_rank and node_id in body_rank:
             score += 100
+        if doc_code_hint_res:
+            doc_id = _doc_id_from_node_id(node_id)
+            if any(r.search(doc_id) for r in doc_code_hint_res):
+                score += 5000
         ordered_scores.append(
             (
                 score,
@@ -447,7 +557,16 @@ def search_leaf_nodes(
             )
         )
     ordered_scores.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
-    return [node_id for _, _, _, node_id in ordered_scores[:limit]]
+    ordered_node_ids = [node_id for _, _, _, node_id in ordered_scores]
+    if doc_code_hint_res:
+        filtered = [
+            nid
+            for nid in ordered_node_ids
+            if any(r.search(_doc_id_from_node_id(nid)) for r in doc_code_hint_res)
+        ]
+        if filtered:
+            ordered_node_ids = filtered
+    return ordered_node_ids[:limit]
 
 
 def _query_has_multiple_terms(raw_query: str) -> bool:
@@ -455,8 +574,75 @@ def _query_has_multiple_terms(raw_query: str) -> bool:
     return len(parts) >= 2
 
 
+_EN_STOPWORDS: set[str] = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "bs",
+    "by",
+    "en",
+    "for",
+    "from",
+    "how",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "such",
+    "that",
+    "the",
+    "their",
+    "then",
+    "these",
+    "this",
+    "those",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "without",
+}
+
+
+def _is_low_signal_term(term: str) -> bool:
+    t = str(term or "").strip()
+    if not t:
+        return True
+    # Only apply stopword filtering to non-CJK terms.
+    if any(is_cjk(ch) for ch in t):
+        return False
+    return t.lower() in _EN_STOPWORDS
+
+
 def _format_trace_must(must_terms: Sequence[str]) -> str:
     return json.dumps([str(t) for t in must_terms if str(t).strip()], ensure_ascii=False)
+
+
+def _focus_unit_id(conn: sqlite3.Connection, node_id: str) -> str:
+    n = get_node_links(conn, node_id)
+    if n.kind in {"article", "clause"}:
+        return n.node_id
+    cur = n
+    while cur.parent_id:
+        parent = get_node_links(conn, cur.parent_id)
+        if parent.kind in {"article", "clause"}:
+            return parent.node_id
+        cur = parent
+    return f"doc:{n.doc_id}"
 
 
 def _article_focus_metrics(
@@ -472,7 +658,7 @@ def _article_focus_metrics(
     total = 0
     article_weights: Dict[str, int] = {}
     for idx, node_id in enumerate(leaf_hits[:k]):
-        article_id = elevate_to_article(conn, node_id)
+        article_id = _focus_unit_id(conn, node_id)
         w = k - idx
         total += w
         article_weights[article_id] = article_weights.get(article_id, 0) + w
@@ -521,12 +707,18 @@ def iterative_search_leaf_nodes(
     auto_must: List[str] = []
     trace: List[str] = []
 
+    doc_code_hints = extract_doc_code_hints(raw_query)
+    for t in base_must:
+        for h in extract_doc_code_hints(t):
+            if h and h not in doc_code_hints:
+                doc_code_hints.append(h)
+
     normalized = normalize_query(raw_query)
     candidate_must: List[str] = []
     seen_terms: set[str] = set()
     for t in [*normalized.article_terms, *normalized.title_terms, *fts_tokens(raw_query)]:
         term = str(t).strip()
-        if not term or term in seen_terms:
+        if not term or term in seen_terms or _is_low_signal_term(term):
             continue
         seen_terms.add(term)
         candidate_must.append(term)
@@ -558,8 +750,10 @@ def iterative_search_leaf_nodes(
                 f"focus_k={focus_k}",
                 f"focus_max_articles={focus_max_articles}",
                 f"mass_top3_threshold={mass_top3_threshold:.2f}",
+                f"doc_code_hints={doc_code_hints}" if doc_code_hints else "",
             ]
         )
+        .strip()
     )
     for i in range(rounds):
         round_qm = query_mode
@@ -592,6 +786,19 @@ def iterative_search_leaf_nodes(
                 action = "relax:set_query_mode=or"
                 reason = "no_hits"
                 stop_reason = "relax_then_retry"
+                # Avoid immediate repeat_state (or, []) after a failed AND round: inject one
+                # additional must term so we can make progress on the next round.
+                used = set(effective_must)
+                next_term = ""
+                for term in candidate_must:
+                    if term in used:
+                        continue
+                    next_term = term
+                    break
+                if next_term:
+                    auto_must.append(next_term)
+                    action = f"{action}+add_must={next_term}"
+                    reason = "no_hits_relax_add_must"
             else:
                 stop_reason = "no_hits"
             trace.append(
@@ -820,6 +1027,46 @@ def apply_triggered_expansion(
     return expanded, diagnostics
 
 
+def _strip_common_noise_lines(md: str) -> Tuple[str, int]:
+    licensed_copy_re = re.compile(
+        r"(?:BSI)?Licensed\s*(?:Copy)?\s*:.*?(?:Uncontrolled\s*Copy,\s*)?(?:\(\s*c\s*\)|©)\s*BSI",
+        flags=re.IGNORECASE,
+    )
+    removed = 0
+    out_lines: List[str] = []
+    for raw in str(md or "").splitlines():
+        line = str(raw)
+        if "licensed" in line.lower():
+            line = licensed_copy_re.sub("", line)
+        s = line.strip()
+        if not s:
+            if raw:
+                removed += 1
+            else:
+                out_lines.append(line)
+            continue
+        low = s.lower()
+        # Common standards headers/footers (e.g., Eurocodes via IHS).
+        if "provided by ihs" in low:
+            removed += 1
+            continue
+        if "no reproduction" in low and "ihs" in low:
+            removed += 1
+            continue
+        if "not for resale" in low:
+            removed += 1
+            continue
+        if "without license from ihs" in low:
+            removed += 1
+            continue
+        if low.startswith("copyright") and ("ihs" in low or "cen" in low or "standardization" in low):
+            removed += 1
+            continue
+        out_lines.append(line)
+    cleaned = "\n".join(out_lines).strip()
+    return cleaned, removed
+
+
 def render_bundle(
     conn: sqlite3.Connection,
     hits: Sequence[str],
@@ -850,11 +1097,33 @@ def render_bundle(
                 seen.add(nid)
                 included.append(nid)
 
+        # Structured outline: when a clause is included, automatically include its direct
+        # table/figure children to avoid "table extracted but missing from bundle".
+        if node.kind == "clause":
+            added = 0
+            for child_id in child_node_ids(conn, node.node_id):
+                child = get_node_links(conn, child_id)
+                if child.kind not in {"table", "figure"}:
+                    continue
+                if child_id in seen:
+                    continue
+                seen.add(child_id)
+                included.append(child_id)
+                added += 1
+                if added >= 8:
+                    break
+
     if order == "chronological":
         included.sort(key=lambda nid: chronological_key(conn, nid))
 
     terms = query_terms(raw_query)
-    out_parts: List[str] = [f"# Bundle\n\n- Query: `{raw_query}`\n\n"]
+    out_parts: List[str] = [
+        f"# Bundle\n\n- Query: `{raw_query}`\n\n",
+        "## 回答约束（Evidence-only）\n"
+        "- 只允许引用本 bundle 中确实出现的条款/式号/原文。\n"
+        "- 不要从记忆补公式/数值；如果公式被抽空/缺失（例如只有式号 `(6.xx)`），请明确写：当前抽取缺失，仅能引用式号 `(6.xx)`。\n"
+        "- 最终回答请附上文末自动生成的 `## 参考依据`。\n\n",
+    ]
     if trace_lines:
         out_parts.append("## 检索轨迹\n")
         for line in trace_lines:
@@ -870,6 +1139,10 @@ def render_bundle(
         out_parts.append("\n")
     rendered_nodes: List[Node] = []
 
+    planned_nodes = len(included)
+    truncated_nodes = 0
+    snippet_nodes = 0
+    noise_lines_stripped = 0
     remaining = max_chars
 
     for node_id in included:
@@ -904,6 +1177,13 @@ def render_bundle(
             if "body_md" in out:
                 node.body_md = str(out.get("body_md") or "")
                 node.body_plain = markdown_to_plain(node.body_md)
+
+        if node.is_leaf and node.body_md:
+            cleaned, removed = _strip_common_noise_lines(node.body_md)
+            if removed:
+                noise_lines_stripped += removed
+                node.body_md = cleaned
+                node.body_plain = markdown_to_plain(node.body_md)
         header = (
             f"## {node.doc_title} — {node.title}\n\n"
             f"- node_id: `{display_node_id(node.node_id)}`\n"
@@ -921,6 +1201,7 @@ def render_bundle(
                     node.body_plain, terms, min(per_node_max_chars, max(200, remaining - len(header)))
                 )
                 body = snippet.strip() + "\n\n*(SNIPPET)*\n"
+                snippet_nodes += 1
             else:
                 body = node.body_md.strip() + "\n"
                 if len(body) > per_node_max_chars or len(header) + len(body) > remaining:
@@ -928,6 +1209,7 @@ def render_bundle(
                         node.body_plain, terms, min(per_node_max_chars, max(200, remaining - len(header)))
                     )
                     body = snippet.strip() + "\n\n*(TRUNCATED)*\n"
+                    truncated_nodes += 1
 
         chunk = header + body + ("\n" if body else "")
         if len(chunk) > remaining:
@@ -935,6 +1217,27 @@ def render_bundle(
         out_parts.append(chunk)
         remaining -= len(chunk)
         rendered_nodes.append(node)
+
+    budget_exhausted = len(rendered_nodes) < planned_nodes
+    if budget_exhausted or truncated_nodes or snippet_nodes or noise_lines_stripped:
+        out_parts.append("## 渲染提示\n")
+        out_parts.append(
+            f"- planned_nodes={planned_nodes} rendered_nodes={len(rendered_nodes)} budget_exhausted={str(budget_exhausted).lower()}\n"
+        )
+        out_parts.append(
+            f"- render: neighbors={int(neighbors)} order={order} max_chars={int(max_chars)} per_node_max_chars={int(per_node_max_chars)} body={body_mode}\n"
+        )
+        if truncated_nodes:
+            out_parts.append(f"- markers: truncated_nodes={truncated_nodes}\n")
+        if snippet_nodes:
+            out_parts.append(f"- markers: snippet_nodes={snippet_nodes}\n")
+        if noise_lines_stripped:
+            out_parts.append(f"- markers: noise_lines_stripped={noise_lines_stripped}\n")
+        if budget_exhausted:
+            out_parts.append(
+                "- 建议：优先减小 `--neighbors` / `--limit`，或增大 `--max-chars` / `--per-node-max-chars`，必要时使用 `--body snippet`。\n"
+            )
+        out_parts.append("\n")
 
     out_parts.append("## 参考依据\n")
     seen_cites: set[str] = set()
@@ -960,135 +1263,867 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         timeout_ms = int(getattr(args, "timeout_ms", 0) or 0)
         with SqliteTimeout(conn, timeout_ms) as timeout:
             try:
-                raw_query = args.query
-                query_mode = args.query_mode
-                must_terms = list(args.must)
-                enable_hooks = bool(getattr(args, "enable_hooks", False))
-                diagnostics: List[str] = []
-
-                if enable_hooks:
-                    out, digest = run_hook(
-                        root,
-                        "pre_search",
-                        {
-                            "stage": "pre_search",
-                            "query": raw_query,
-                            "query_mode": query_mode,
-                            "must": must_terms,
-                        },
-                    )
-                    if digest:
-                        diagnostics.append(f"hook: pre_search sha1={digest} path=hooks/pre_search.py")
-                    if "query" in out:
-                        candidate = str(out.get("query") or "").strip()
-                        if candidate:
-                            raw_query = candidate
-                    if "query_mode" in out:
-                        qm = str(out.get("query_mode") or "").strip().lower()
-                        if qm in {"or", "and"}:
-                            query_mode = qm
-                    if "must" in out:
-                        value = out.get("must")
-                        if isinstance(value, list):
-                            must_terms = [str(v).strip() for v in value if str(v).strip()]
-
-                iter_result = iterative_search_leaf_nodes(
-                    conn,
-                    raw_query,
-                    limit=args.limit,
-                    query_mode=query_mode,
-                    must_terms=must_terms,
-                    max_rounds=(
-                        1
-                        if bool(getattr(args, "no_iter", False))
-                        else max(1, min(5, int(getattr(args, "iter_max_rounds", 5))))
-                    ),
-                    focus_k=max(1, int(getattr(args, "iter_focus_k", 12))),
-                    focus_max_articles=max(1, int(getattr(args, "iter_focus_max_articles", 3))),
-                    mass_top3_threshold=max(0.0, min(1.0, float(getattr(args, "iter_mass_top3_threshold", 0.8)))),
-                )
-                hits = list(iter_result.hits)
-                query_mode = str(iter_result.query_mode or query_mode)
-                must_terms = list(iter_result.must_terms or must_terms)
-                trace_lines = list(iter_result.trace_lines or [])
-                if not hits:
-                    die("No matches. Try a different query or rebuild indexes.")
-                if enable_hooks:
-                    out, digest = run_hook(
-                        root,
-                        "post_search",
-                        {
-                            "stage": "post_search",
-                            "query": raw_query,
-                            "query_mode": query_mode,
-                            "must": must_terms,
-                            "hits": list(hits),
-                        },
-                    )
-                    if digest:
-                        diagnostics.append(f"hook: post_search sha1={digest} path=hooks/post_search.py")
-                    if "hits" in out:
-                        value = out.get("hits")
-                        if not isinstance(value, list):
-                            die("Hook post_search must return {'hits': [...]} list")
-                        hits = [str(v) for v in value if str(v)]
-                elevated: List[str] = []
-                seen = set()
-                for node_id in hits:
-                    article_id = elevate_to_article(conn, node_id)
-                    if article_id in seen:
-                        continue
-                    seen.add(article_id)
-                    elevated.append(article_id)
-                if enable_hooks:
-                    out, digest = run_hook(
-                        root,
-                        "pre_expand",
-                        {
-                            "stage": "pre_expand",
-                            "query": raw_query,
-                            "hits": list(elevated),
-                        },
-                    )
-                    if digest:
-                        diagnostics.append(f"hook: pre_expand sha1={digest} path=hooks/pre_expand.py")
-                    if "hits" in out:
-                        value = out.get("hits")
-                        if not isinstance(value, list):
-                            die("Hook pre_expand must return {'hits': [...]} list")
-                        elevated = [str(v) for v in value if str(v)]
-
-                normalized_query = normalize_query(raw_query)
-                elevated, expansion_diags = apply_triggered_expansion(
-                    conn,
-                    normalized_query,
-                    elevated,
-                    force_debug=args.debug_triggers,
-                )
-                diagnostics.extend(expansion_diags)
-                if enable_hooks:
-                    pre_render_path = root / "hooks" / "pre_render.py"
-                    if pre_render_path.exists():
-                        diagnostics.append(f"hook: pre_render sha1={sha1_file(pre_render_path)} path=hooks/pre_render.py")
-                content, _ = render_bundle(
-                    conn,
-                    elevated,
-                    raw_query=raw_query,
-                    neighbors=args.neighbors,
-                    max_chars=args.max_chars,
-                    per_node_max_chars=args.per_node_max_chars,
-                    body_mode=args.body,
-                    order=args.order,
-                    trace_lines=trace_lines,
-                    diagnostics=diagnostics,
-                    hooks_root=root if enable_hooks else None,
-                    enable_hooks=enable_hooks,
-                )
+                bundle_result = _run_bundle_pipeline(conn, root, args)
                 out_path = safe_output_path(root, args.out)
-                out_path.write_text(content, encoding="utf-8", newline="\n")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(bundle_result.content, encoding="utf-8", newline="\n")
                 print("[OK] Wrote bundle:", out_path)
                 return 0
             except sqlite3.OperationalError as e:
+                if timeout.timed_out:
+                    die(f"SQLite query timed out after {timeout_ms}ms")
+                raise
+    finally:
+        conn.close()
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _is_sha256_hex(s: str) -> bool:
+    s = (s or "").strip().lower()
+    return bool(re.fullmatch(r"[0-9a-f]{64}", s))
+
+
+def _load_manifest_summary(root: Path) -> Dict[str, object]:
+    manifest_path = root / "manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    docs = data.get("docs")
+    doc_count = len(docs) if isinstance(docs, list) else 0
+    return {
+        "skill_name": data.get("skill_name") or root.name,
+        "title": data.get("title") or "",
+        "generated_at": data.get("generated_at") or "",
+        "doc_count": doc_count,
+    }
+
+
+def _default_run_dir_name() -> str:
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    suffix = os.urandom(3).hex()
+    return f"research_runs/{ts}-{suffix}"
+
+
+def _detect_next_round(run_dir: Path) -> int:
+    best = 0
+    if not run_dir.exists():
+        return 1
+    for p in run_dir.glob("bundle.round*.md"):
+        m = re.search(r"bundle\.round(\d+)\.md$", p.name)
+        if not m:
+            continue
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if n > best:
+            best = n
+    return best + 1 if best > 0 else 1
+
+
+@dataclass(frozen=True)
+class BundlePipelineResult:
+    raw_query: str
+    query_mode: str
+    must_terms: List[str]
+    leaf_hits: List[str]
+    trace_lines: List[str]
+    elevated_hits: List[str]
+    expanded_hits: List[str]
+    diagnostics: List[str]
+    content: str
+    rendered_nodes: List[Node]
+    included_node_ids: List[str]
+
+
+def _run_bundle_pipeline(conn: sqlite3.Connection, root: Path, args: argparse.Namespace) -> BundlePipelineResult:
+    raw_query = args.query
+    query_mode = args.query_mode
+    must_terms = list(args.must)
+    enable_hooks = bool(getattr(args, "enable_hooks", False))
+    diagnostics: List[str] = []
+
+    if enable_hooks:
+        out, digest = run_hook(
+            root,
+            "pre_search",
+            {
+                "stage": "pre_search",
+                "query": raw_query,
+                "query_mode": query_mode,
+                "must": must_terms,
+            },
+        )
+        if digest:
+            diagnostics.append(f"hook: pre_search sha1={digest} path=hooks/pre_search.py")
+        if "query" in out:
+            candidate = str(out.get("query") or "").strip()
+            if candidate:
+                raw_query = candidate
+        if "query_mode" in out:
+            qm = str(out.get("query_mode") or "").strip().lower()
+            if qm in {"or", "and"}:
+                query_mode = qm
+        if "must" in out:
+            value = out.get("must")
+            if isinstance(value, list):
+                must_terms = [str(v).strip() for v in value if str(v).strip()]
+
+    iter_result = iterative_search_leaf_nodes(
+        conn,
+        raw_query,
+        limit=args.limit,
+        query_mode=query_mode,
+        must_terms=must_terms,
+        max_rounds=(
+            1
+            if bool(getattr(args, "no_iter", False))
+            else max(1, min(5, int(getattr(args, "iter_max_rounds", 5))))
+        ),
+        focus_k=max(1, int(getattr(args, "iter_focus_k", 12))),
+        focus_max_articles=max(1, int(getattr(args, "iter_focus_max_articles", 3))),
+        mass_top3_threshold=max(
+            0.0, min(1.0, float(getattr(args, "iter_mass_top3_threshold", 0.8)))
+        ),
+    )
+    leaf_hits = list(iter_result.hits)
+    query_mode = str(iter_result.query_mode or query_mode)
+    must_terms = list(iter_result.must_terms or must_terms)
+    trace_lines = list(iter_result.trace_lines or [])
+    if not leaf_hits:
+        die("No matches. Try a different query or rebuild indexes.")
+
+    if enable_hooks:
+        out, digest = run_hook(
+            root,
+            "post_search",
+            {
+                "stage": "post_search",
+                "query": raw_query,
+                "query_mode": query_mode,
+                "must": must_terms,
+                "hits": list(leaf_hits),
+            },
+        )
+        if digest:
+            diagnostics.append(f"hook: post_search sha1={digest} path=hooks/post_search.py")
+        if "hits" in out:
+            value = out.get("hits")
+            if not isinstance(value, list):
+                die("Hook post_search must return {'hits': [...]} list")
+            leaf_hits = [str(v) for v in value if str(v)]
+
+    elevated: List[str] = []
+    seen = set()
+    for node_id in leaf_hits:
+        article_id = elevate_to_article(conn, node_id)
+        if article_id in seen:
+            continue
+        seen.add(article_id)
+        elevated.append(article_id)
+
+    if enable_hooks:
+        out, digest = run_hook(
+            root,
+            "pre_expand",
+            {
+                "stage": "pre_expand",
+                "query": raw_query,
+                "hits": list(elevated),
+            },
+        )
+        if digest:
+            diagnostics.append(f"hook: pre_expand sha1={digest} path=hooks/pre_expand.py")
+        if "hits" in out:
+            value = out.get("hits")
+            if not isinstance(value, list):
+                die("Hook pre_expand must return {'hits': [...]} list")
+            elevated = [str(v) for v in value if str(v)]
+
+    normalized_query = normalize_query(raw_query)
+    expanded, expansion_diags = apply_triggered_expansion(
+        conn,
+        normalized_query,
+        elevated,
+        force_debug=args.debug_triggers,
+    )
+    diagnostics.extend(expansion_diags)
+    if enable_hooks:
+        pre_render_path = root / "hooks" / "pre_render.py"
+        if pre_render_path.exists():
+            diagnostics.append(
+                f"hook: pre_render sha1={sha1_file(pre_render_path)} path=hooks/pre_render.py"
+            )
+
+    included_node_ids: List[str] = []
+    seen_nodes: set[str] = set()
+    for node_id in expanded:
+        node = get_node(conn, node_id)
+        for pid in iter_parents(conn, node):
+            if pid not in seen_nodes:
+                seen_nodes.add(pid)
+                included_node_ids.append(pid)
+        for nid in iter_neighbors(conn, node, int(args.neighbors)):
+            if nid not in seen_nodes:
+                seen_nodes.add(nid)
+                included_node_ids.append(nid)
+        if node.kind == "clause":
+            added = 0
+            for child_id in child_node_ids(conn, node.node_id):
+                child = get_node_links(conn, child_id)
+                if child.kind not in {"table", "figure"}:
+                    continue
+                if child_id in seen_nodes:
+                    continue
+                seen_nodes.add(child_id)
+                included_node_ids.append(child_id)
+                added += 1
+                if added >= 8:
+                    break
+    if args.order == "chronological":
+        included_node_ids.sort(key=lambda nid: chronological_key(conn, nid))
+
+    content, rendered_nodes = render_bundle(
+        conn,
+        expanded,
+        raw_query=raw_query,
+        neighbors=args.neighbors,
+        max_chars=args.max_chars,
+        per_node_max_chars=args.per_node_max_chars,
+        body_mode=args.body,
+        order=args.order,
+        trace_lines=trace_lines,
+        diagnostics=diagnostics,
+        hooks_root=root if enable_hooks else None,
+        enable_hooks=enable_hooks,
+    )
+
+    return BundlePipelineResult(
+        raw_query=raw_query,
+        query_mode=query_mode,
+        must_terms=must_terms,
+        leaf_hits=leaf_hits,
+        trace_lines=trace_lines,
+        elevated_hits=elevated,
+        expanded_hits=expanded,
+        diagnostics=diagnostics,
+        content=content,
+        rendered_nodes=rendered_nodes,
+        included_node_ids=included_node_ids,
+    )
+
+
+def _detect_hollow_equations(content: str) -> List[str]:
+    labels: List[str] = []
+    seen: set[str] = set()
+    for ln in (content or "").splitlines():
+        if "=" not in ln:
+            continue
+        eqs = re.findall(r"\((\d+(?:\.\d+)+)\)", ln)
+        if not eqs:
+            continue
+        if not (re.search(r"=\s*\(", ln) or re.search(r"=\s*but\\b", ln, flags=re.IGNORECASE)):
+            continue
+        for e in eqs:
+            if e in seen:
+                continue
+            seen.add(e)
+            labels.append(e)
+    return labels
+
+
+def _verify_bundle(
+    bundle_result: BundlePipelineResult,
+    *,
+    focus_k: int,
+    focus_max_articles: int,
+    mass_top3_threshold: float,
+    focus_diversity: int,
+    focus_mass_top3: float,
+    focus_margin: float,
+    search_limit: int,
+    render_neighbors: int,
+    render_order: str,
+    render_max_chars: int,
+    render_per_node_max_chars: int,
+    render_body_mode: str,
+) -> Dict[str, object]:
+    content = bundle_result.content
+    normalized = normalize_query(bundle_result.raw_query)
+    key_terms: List[str] = []
+    seen_terms: set[str] = set()
+    for t in [*normalized.article_terms, *normalized.title_terms]:
+        term = str(t).strip()
+        if not term or term in seen_terms:
+            continue
+        seen_terms.add(term)
+        key_terms.append(term)
+
+    present = [t for t in key_terms if t in content]
+    missing = [t for t in key_terms if t not in content]
+    coverage = float(len(present)) / float(len(key_terms)) if key_terms else 1.0
+
+    budget_exhausted = len(bundle_result.rendered_nodes) < len(bundle_result.included_node_ids)
+    truncated_nodes = content.count("*(TRUNCATED)*")
+    snippet_nodes = content.count("*(SNIPPET)*")
+
+    checks: List[Dict[str, object]] = []
+    blocking_issues: List[str] = []
+    non_blocking_issues: List[str] = []
+
+    key_terms_ok = len(missing) == 0
+    checks.append(
+        {
+            "name": "key_term_coverage",
+            "ok": key_terms_ok,
+            "terms": key_terms,
+            "present": present,
+            "missing": missing,
+            "coverage": coverage,
+        }
+    )
+    if not key_terms_ok:
+        blocking_issues.append("missing_key_terms")
+
+    checks.append(
+        {
+            "name": "budget_exhausted",
+            "ok": not budget_exhausted,
+            "budget_exhausted": budget_exhausted,
+            "planned_nodes": len(bundle_result.included_node_ids),
+            "rendered_nodes": len(bundle_result.rendered_nodes),
+        }
+    )
+    if budget_exhausted:
+        blocking_issues.append("budget_exhausted")
+
+    if truncated_nodes or snippet_nodes:
+        non_blocking_issues.append("nodes_truncated_or_snippet")
+    checks.append(
+        {
+            "name": "render_markers",
+            "ok": True,
+            "truncated_nodes": truncated_nodes,
+            "snippet_nodes": snippet_nodes,
+        }
+    )
+
+    hollow_eqs = _detect_hollow_equations(content)
+    if hollow_eqs:
+        non_blocking_issues.append("hollow_equations")
+    checks.append(
+        {
+            "name": "hollow_equations",
+            "ok": not hollow_eqs,
+            "equations": hollow_eqs[:25],
+            "count": len(hollow_eqs),
+        }
+    )
+
+    focus_ok = (focus_diversity <= int(focus_max_articles)) and (
+        float(focus_mass_top3) >= float(mass_top3_threshold)
+    )
+    checks.append(
+        {
+            "name": "focus",
+            "ok": focus_ok,
+            "focus_k": int(focus_k),
+            "focus_max_articles": int(focus_max_articles),
+            "mass_top3_threshold": float(mass_top3_threshold),
+            "focus": {
+                "diversity": int(focus_diversity),
+                "mass_top3": float(focus_mass_top3),
+                "margin": float(focus_margin),
+            },
+        }
+    )
+    if not focus_ok:
+        non_blocking_issues.append("focus_not_converged")
+
+    suggestions: List[str] = []
+    suggested_next_params: List[Dict[str, object]] = []
+
+    def _suggest_set(params: Dict[str, object], reason: str) -> None:
+        if not params:
+            return
+        suggested_next_params.append({"set": params, "reason": reason})
+
+    def _suggest_add_must(terms: Sequence[str], reason: str) -> None:
+        items = [str(t).strip() for t in terms if str(t).strip() and not _is_low_signal_term(str(t))]
+        if not items:
+            return
+        suggested_next_params.append({"add_must": items, "reason": reason})
+
+    if "missing_key_terms" in blocking_issues:
+        suggestions.append("Revise query or add --must terms so key terms appear in the evidence bundle.")
+        _suggest_add_must(missing[:3], "missing_key_terms")
+    if "budget_exhausted" in blocking_issues:
+        suggestions.append("Increase --max-chars / --per-node-max-chars or reduce --neighbors to avoid truncation.")
+        if int(render_neighbors) > 0:
+            _suggest_set({"neighbors": 0}, "budget_exhausted")
+        if int(render_max_chars) < 120000:
+            _suggest_set({"max_chars": min(120000, int(render_max_chars) * 2)}, "budget_exhausted")
+        if int(render_per_node_max_chars) < 12000:
+            _suggest_set({"per_node_max_chars": min(12000, max(int(render_per_node_max_chars) + 2000, 8000))}, "budget_exhausted")
+        if str(render_body_mode) == "full":
+            _suggest_set({"body": "snippet"}, "budget_exhausted")
+        if int(search_limit) > 12:
+            _suggest_set({"limit": 12}, "budget_exhausted")
+    if truncated_nodes and "budget_exhausted" not in blocking_issues:
+        suggestions.append("Consider increasing --per-node-max-chars if important nodes are marked *(TRUNCATED)*.")
+        _suggest_set({"per_node_max_chars": min(12000, max(int(render_per_node_max_chars) + 2000, 8000))}, "nodes_truncated_or_snippet")
+    if not focus_ok:
+        suggestions.append("Consider adding --must terms or using --query-mode and to focus on fewer articles.")
+        if str(bundle_result.query_mode) != "and" and _query_has_multiple_terms(bundle_result.raw_query):
+            _suggest_set({"query_mode": "and"}, "focus_not_converged")
+        normalized_q = normalize_query(bundle_result.raw_query)
+        candidate = [*normalized_q.article_terms, *normalized_q.title_terms, *fts_tokens(bundle_result.raw_query)]
+        existing = {str(t).strip() for t in (bundle_result.must_terms or []) if str(t).strip()}
+        must_candidates: List[str] = []
+        for t in candidate:
+            term = str(t).strip()
+            if not term or term in existing or _is_low_signal_term(term):
+                continue
+            must_candidates.append(term)
+            if len(must_candidates) >= 3:
+                break
+        _suggest_add_must(must_candidates, "focus_not_converged")
+
+    if hollow_eqs:
+        suggestions.append(
+            "Some equations look hollow/missing in the extracted evidence. Do NOT invent formulas; cite only the equation numbers (e.g. (6.xx)) and state extraction is missing."
+        )
+
+    ok = not blocking_issues
+    verdict = "pass" if ok else "fail"
+    stop_recommended = bool(ok and focus_ok and key_terms_ok)
+    stop_reason = "pass_and_converged" if stop_recommended else ""
+
+    doc_code_hints = extract_doc_code_hints(bundle_result.raw_query)
+    for t in bundle_result.must_terms:
+        for h in extract_doc_code_hints(str(t)):
+            if h and h not in doc_code_hints:
+                doc_code_hints.append(h)
+
+    return {
+        "schema": "kbtool.verify.v1",
+        "ts": _utc_now_iso(),
+        "ok": ok,
+        "verdict": verdict,
+        "stop_recommended": stop_recommended,
+        "stop_reason": stop_reason,
+        "blocking_issues": blocking_issues,
+        "non_blocking_issues": non_blocking_issues,
+        "checks": checks,
+        "suggestions": suggestions,
+        "suggested_next_params": suggested_next_params,
+        "hints": {"doc_code_hints": doc_code_hints},
+        "params": {
+            "focus_k": int(focus_k),
+            "focus_max_articles": int(focus_max_articles),
+            "mass_top3_threshold": float(mass_top3_threshold),
+        },
+        "render": {
+            "limit": int(search_limit),
+            "query_mode": str(bundle_result.query_mode),
+            "must": list(bundle_result.must_terms),
+            "neighbors": int(render_neighbors),
+            "order": str(render_order),
+            "max_chars": int(render_max_chars),
+            "per_node_max_chars": int(render_per_node_max_chars),
+            "body_mode": str(render_body_mode),
+        },
+    }
+
+
+def cmd_research(args: argparse.Namespace) -> int:
+    root = resolve_root(args.root)
+    db_path = root / args.db
+    conn = open_db(db_path)
+    try:
+        timeout_ms = int(getattr(args, "timeout_ms", 0) or 0)
+        with SqliteTimeout(conn, timeout_ms) as timeout:
+            try:
+                run_dir_arg = str(getattr(args, "run_dir", "") or "").strip()
+                if not run_dir_arg:
+                    run_dir_arg = _default_run_dir_name()
+                run_dir = safe_output_path(root, run_dir_arg)
+                if run_dir.exists() and run_dir.is_file():
+                    die(f"Invalid --run-dir (points to a file): {run_dir_arg!r}")
+                run_dir.mkdir(parents=True, exist_ok=True)
+
+                round_arg = int(getattr(args, "round", 0) or 0)
+                round_n = round_arg if round_arg > 0 else _detect_next_round(run_dir)
+                if round_n <= 0:
+                    die(f"Invalid round number: {round_n}")
+                round_tag = f"{round_n:02d}"
+
+                bundle_name = f"bundle.round{round_tag}.md"
+                trace_name = f"trace.round{round_tag}.json"
+                verify_name = f"verify.round{round_tag}.json"
+                trace_jsonl_name = "trace.jsonl"
+
+                bundle_path = run_dir / bundle_name
+                trace_path = run_dir / trace_name
+                verify_path = run_dir / verify_name
+                trace_jsonl_path = run_dir / trace_jsonl_name
+
+                bundle_result = _run_bundle_pipeline(conn, root, args)
+                bundle_path.write_text(bundle_result.content, encoding="utf-8", newline="\n")
+
+                focus_k = max(1, int(getattr(args, "iter_focus_k", 12)))
+                focus_max_articles = max(1, int(getattr(args, "iter_focus_max_articles", 3)))
+                mass_top3_threshold = max(0.0, min(1.0, float(getattr(args, "iter_mass_top3_threshold", 0.8))))
+                div, mass_top3, margin = _article_focus_metrics(conn, bundle_result.leaf_hits, focus_k=focus_k)
+
+                planner_json_raw = str(getattr(args, "planner_json", "") or "").strip()
+                planner_sha256 = ""
+                if planner_json_raw:
+                    planner_sha256 = hashlib.sha256(planner_json_raw.encode("utf-8", errors="ignore")).hexdigest()
+                planner_meta: object = {}
+                if planner_json_raw:
+                    try:
+                        planner_meta = json.loads(planner_json_raw)
+                    except (json.JSONDecodeError, ValueError):
+                        planner_meta = {"raw": planner_json_raw}
+
+                planner_artifacts: Dict[str, object] = {}
+                planner_missing: List[str] = []
+                if not planner_json_raw:
+                    planner_missing.append("planner_json")
+                elif not isinstance(planner_meta, dict):
+                    planner_missing.extend(["planner.model", "planner.temperature", "planner.prompt_sha256"])
+                else:
+                    model = str(planner_meta.get("model") or "").strip()
+                    if not model:
+                        planner_missing.append("planner.model")
+                    temp_raw = planner_meta.get("temperature")
+                    try:
+                        float(temp_raw)
+                    except (TypeError, ValueError):
+                        planner_missing.append("planner.temperature")
+
+                    prompt_sha = str(planner_meta.get("prompt_sha256") or "").strip()
+                    prompt_text = planner_meta.get("prompt")
+                    prompt_path = str(planner_meta.get("prompt_path") or "").strip()
+                    if prompt_path:
+                        src = Path(prompt_path)
+                        if not src.is_absolute():
+                            src = (root / src).resolve()
+                        if not src.exists() or not src.is_file():
+                            planner_missing.append("planner.prompt_path")
+                        else:
+                            sha = _sha256_file(src)
+                            dest_ext = src.suffix if src.suffix else ".txt"
+                            dest_name = f"planner.round{round_tag}.prompt{dest_ext}"
+                            dest = run_dir / dest_name
+                            dest.write_bytes(src.read_bytes())
+                            planner_meta = {**planner_meta, "prompt_sha256": sha, "prompt_path": str(src)}
+                            planner_artifacts["prompt"] = {
+                                "path": str(dest.relative_to(root)).replace("\\", "/"),
+                                "sha256": sha,
+                                "bytes": int(dest.stat().st_size),
+                            }
+                    elif isinstance(prompt_text, str) and prompt_text.strip():
+                        sha = hashlib.sha256(prompt_text.encode("utf-8", errors="ignore")).hexdigest()
+                        dest = run_dir / f"planner.round{round_tag}.prompt.txt"
+                        dest.write_text(prompt_text, encoding="utf-8", newline="\n")
+                        planner_meta = {**planner_meta, "prompt_sha256": sha}
+                        planner_artifacts["prompt"] = {
+                            "path": str(dest.relative_to(root)).replace("\\", "/"),
+                            "sha256": sha,
+                            "bytes": int(dest.stat().st_size),
+                        }
+                    elif not _is_sha256_hex(prompt_sha):
+                        planner_missing.append("planner.prompt_sha256")
+
+                note = str(getattr(args, "note", "") or "").strip()
+
+                kbtool_sha = ""
+                sha_path = root / "kbtool.sha1"
+                if sha_path.exists():
+                    kbtool_sha = sha_path.read_text(encoding="utf-8", errors="ignore").strip()
+
+                manifest_summary = _load_manifest_summary(root)
+
+                bundle_rel = str(bundle_path.relative_to(root)).replace("\\", "/")
+                trace_rel = str(trace_path.relative_to(root)).replace("\\", "/")
+                verify_rel = str(verify_path.relative_to(root)).replace("\\", "/")
+                doc_code_hints = extract_doc_code_hints(bundle_result.raw_query)
+                for t in bundle_result.must_terms:
+                    for h in extract_doc_code_hints(str(t)):
+                        if h and h not in doc_code_hints:
+                            doc_code_hints.append(h)
+
+                input_params = {
+                    "query_mode": str(getattr(args, "query_mode", "")),
+                    "must": list(getattr(args, "must", []) or []),
+                    "limit": int(getattr(args, "limit", 20)),
+                    "neighbors": int(getattr(args, "neighbors", 0) or 0),
+                    "order": str(getattr(args, "order", "")),
+                    "max_chars": int(getattr(args, "max_chars", 0) or 0),
+                    "per_node_max_chars": int(getattr(args, "per_node_max_chars", 0) or 0),
+                    "body": str(getattr(args, "body", "")),
+                    "debug_triggers": bool(getattr(args, "debug_triggers", False)),
+                    "enable_hooks": bool(getattr(args, "enable_hooks", False)),
+                    "timeout_ms": int(getattr(args, "timeout_ms", 0) or 0),
+                    "no_iter": bool(getattr(args, "no_iter", False)),
+                    "iter": {
+                        "max_rounds": (
+                            1
+                            if bool(getattr(args, "no_iter", False))
+                            else max(1, min(5, int(getattr(args, "iter_max_rounds", 5))))
+                        ),
+                        "focus_k": focus_k,
+                        "focus_max_articles": focus_max_articles,
+                        "mass_top3_threshold": mass_top3_threshold,
+                    },
+                }
+
+                trace_payload: Dict[str, object] = {
+                    "schema": "kbtool.research_round.v1",
+                    "ts": _utc_now_iso(),
+                    "round": round_n,
+                    "skill": {
+                        **manifest_summary,
+                        "db": str(Path(args.db)),
+                        "kbtool_sha1": kbtool_sha,
+                    },
+                    "input": {
+                        "query": str(getattr(args, "query", "")),
+                        "params": input_params,
+                        "planner": planner_meta,
+                        "planner_sha256": planner_sha256,
+                        "planner_artifacts": planner_artifacts,
+                        "planner_missing": planner_missing,
+                        "note": note,
+                    },
+                    "effective": {
+                        "query": bundle_result.raw_query,
+                        "query_mode": bundle_result.query_mode,
+                        "must": bundle_result.must_terms,
+                        "doc_code_hints": doc_code_hints,
+                        "iter": {
+                            "max_rounds": (1 if bool(getattr(args, "no_iter", False)) else max(1, min(5, int(getattr(args, "iter_max_rounds", 5))))),
+                            "focus_k": focus_k,
+                            "focus_max_articles": focus_max_articles,
+                            "mass_top3_threshold": mass_top3_threshold,
+                        },
+                    },
+                    "retrieval": {
+                        "iterative": {
+                            "leaf_hits": bundle_result.leaf_hits,
+                            "trace_lines": bundle_result.trace_lines,
+                            "focus": {
+                                "diversity": div,
+                                "mass_top3": mass_top3,
+                                "margin": margin,
+                            },
+                        },
+                        "articles": {
+                            "elevated": bundle_result.elevated_hits,
+                            "expanded": bundle_result.expanded_hits,
+                        },
+                        "render": {
+                            "neighbors": int(args.neighbors),
+                            "order": str(args.order),
+                            "max_chars": int(args.max_chars),
+                            "per_node_max_chars": int(args.per_node_max_chars),
+                            "body_mode": str(args.body),
+                            "planned_node_ids": bundle_result.included_node_ids,
+                            "rendered_nodes": [node_to_dict(n, include_body=False) for n in bundle_result.rendered_nodes],
+                            "budget_exhausted": len(bundle_result.rendered_nodes) < len(bundle_result.included_node_ids),
+                            "markers": {
+                                "truncated_nodes": bundle_result.content.count("*(TRUNCATED)*"),
+                                "snippet_nodes": bundle_result.content.count("*(SNIPPET)*"),
+                            },
+                        },
+                        "diagnostics": bundle_result.diagnostics,
+                    },
+                    "outputs": {
+                        "bundle_md": bundle_rel,
+                        "trace_json": trace_rel,
+                        "verify_json": verify_rel,
+                        "trace_jsonl": str(trace_jsonl_path.relative_to(root)).replace("\\", "/"),
+                    },
+                }
+
+                trace_path.write_text(json.dumps(trace_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+                verify_payload = _verify_bundle(
+                    bundle_result,
+                    focus_k=focus_k,
+                    focus_max_articles=focus_max_articles,
+                    mass_top3_threshold=mass_top3_threshold,
+                    focus_diversity=div,
+                    focus_mass_top3=mass_top3,
+                    focus_margin=margin,
+                    search_limit=int(getattr(args, "limit", 20)),
+                    render_neighbors=int(args.neighbors),
+                    render_order=str(args.order),
+                    render_max_chars=int(args.max_chars),
+                    render_per_node_max_chars=int(args.per_node_max_chars),
+                    render_body_mode=str(args.body),
+                )
+                verify_payload["round"] = round_n
+                verify_payload["focus"] = {"diversity": div, "mass_top3": mass_top3, "margin": margin}
+                verify_payload["audit"] = {
+                    "planner_ok": not planner_missing,
+                    "planner_missing": planner_missing,
+                    "planner_sha256": planner_sha256,
+                    "planner_artifacts": planner_artifacts,
+                }
+
+                checks = verify_payload.get("checks")
+                if isinstance(checks, list):
+                    checks.append(
+                        {
+                            "name": "planner_audit_metadata",
+                            "ok": not planner_missing,
+                            "missing": planner_missing,
+                            "planner_sha256": planner_sha256,
+                            "planner_artifacts": planner_artifacts,
+                        }
+                    )
+
+                if planner_missing:
+                    blocking = verify_payload.get("blocking_issues")
+                    if isinstance(blocking, list) and "audit_incomplete" not in blocking:
+                        blocking.append("audit_incomplete")
+                    verify_payload["ok"] = False
+                    verify_payload["verdict"] = "fail"
+                    verify_payload["stop_recommended"] = False
+                    verify_payload["stop_reason"] = ""
+                    suggestions = verify_payload.get("suggestions")
+                    if isinstance(suggestions, list):
+                        suggestions.insert(
+                            0,
+                            "Audit metadata incomplete. Provide --planner-json with at least: {model, temperature, prompt_sha256 or prompt_path}.",
+                        )
+                verify_path.write_text(json.dumps(verify_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+                planned_nodes = len(bundle_result.included_node_ids)
+                rendered_nodes = len(bundle_result.rendered_nodes)
+                truncated_nodes = bundle_result.content.count("*(TRUNCATED)*")
+                snippet_nodes = bundle_result.content.count("*(SNIPPET)*")
+                budget_exhausted = rendered_nodes < planned_nodes
+
+                event = {
+                    "schema": "kbtool.research_event.v1",
+                    "ts": _utc_now_iso(),
+                    "round": round_n,
+                    "run_dir": str(run_dir.relative_to(root)).replace("\\", "/"),
+                    "input": {
+                        "query": str(getattr(args, "query", "")),
+                        "params": input_params,
+                        "planner_sha256": planner_sha256,
+                        "planner_missing": planner_missing,
+                        "note": note,
+                    },
+                    "effective": {
+                        "query": bundle_result.raw_query,
+                        "query_mode": bundle_result.query_mode,
+                        "must": bundle_result.must_terms,
+                        "doc_code_hints": doc_code_hints,
+                    },
+                    "render": {
+                        "limit": int(getattr(args, "limit", 20)),
+                        "neighbors": int(args.neighbors),
+                        "order": str(args.order),
+                        "max_chars": int(args.max_chars),
+                        "per_node_max_chars": int(args.per_node_max_chars),
+                        "body_mode": str(args.body),
+                    },
+                    "stats": {
+                        "planned_nodes": planned_nodes,
+                        "rendered_nodes": rendered_nodes,
+                        "budget_exhausted": budget_exhausted,
+                        "truncated_nodes": truncated_nodes,
+                        "snippet_nodes": snippet_nodes,
+                    },
+                    "focus": {"diversity": div, "mass_top3": mass_top3, "margin": margin},
+                    "bundle": {"path": bundle_rel, "sha256": _sha256_file(bundle_path)},
+                    "trace": {"path": trace_rel, "sha256": _sha256_file(trace_path)},
+                    "verify": {"path": verify_rel, "sha256": _sha256_file(verify_path)},
+                    "ok": bool(verify_payload.get("ok")),
+                    "stop_recommended": bool(verify_payload.get("stop_recommended")),
+                    "stop_reason": str(verify_payload.get("stop_reason") or ""),
+                    "blocking_issues": verify_payload.get("blocking_issues", []),
+                    "non_blocking_issues": verify_payload.get("non_blocking_issues", []),
+                    "suggestions": verify_payload.get("suggestions", []),
+                    "suggested_next_params": verify_payload.get("suggested_next_params", []),
+                }
+                with trace_jsonl_path.open("a", encoding="utf-8", newline="\n") as f:
+                    f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+                result = {
+                    "tool": "kbtool",
+                    "cmd": "research",
+                    "round": round_n,
+                    "ok": bool(verify_payload.get("ok")),
+                    "stop_recommended": bool(verify_payload.get("stop_recommended")),
+                    "stop_reason": str(verify_payload.get("stop_reason") or ""),
+                    "run_dir": str(run_dir.relative_to(root)).replace("\\", "/"),
+                    "paths": {
+                        "bundle_md": bundle_rel,
+                        "trace_json": trace_rel,
+                        "verify_json": verify_rel,
+                        "trace_jsonl": str(trace_jsonl_path.relative_to(root)).replace("\\", "/"),
+                    },
+                    "input": {
+                        "query": str(getattr(args, "query", "")),
+                        "params": input_params,
+                        "planner_sha256": planner_sha256,
+                        "planner_missing": planner_missing,
+                        "note": note,
+                    },
+                    "audit": verify_payload.get("audit", {}),
+                    "effective": {
+                        "query": bundle_result.raw_query,
+                        "query_mode": bundle_result.query_mode,
+                        "must": bundle_result.must_terms,
+                        "doc_code_hints": doc_code_hints,
+                    },
+                    "render": {
+                        "limit": int(getattr(args, "limit", 20)),
+                        "neighbors": int(args.neighbors),
+                        "order": str(args.order),
+                        "max_chars": int(args.max_chars),
+                        "per_node_max_chars": int(args.per_node_max_chars),
+                        "body_mode": str(args.body),
+                    },
+                    "stats": {
+                        "planned_nodes": planned_nodes,
+                        "rendered_nodes": rendered_nodes,
+                        "budget_exhausted": budget_exhausted,
+                        "truncated_nodes": truncated_nodes,
+                        "snippet_nodes": snippet_nodes,
+                    },
+                    "focus": {"diversity": div, "mass_top3": mass_top3, "margin": margin},
+                    "blocking_issues": verify_payload.get("blocking_issues", []),
+                    "non_blocking_issues": verify_payload.get("non_blocking_issues", []),
+                    "suggestions": verify_payload.get("suggestions", []),
+                    "suggested_next_params": verify_payload.get("suggested_next_params", []),
+                }
+                print_json(result)
+                return 0
+            except sqlite3.OperationalError:
                 if timeout.timed_out:
                     die(f"SQLite query timed out after {timeout_ms}ms")
                 raise
@@ -1232,8 +2267,25 @@ def cmd_get_node(args: argparse.Namespace) -> int:
     db_path = root / args.db
     conn = open_db(db_path)
     try:
-        node = get_node(conn, args.node_id)
-        print_json(node_to_dict(node, include_body=True))
+        node_id = str(getattr(args, "node_id", "") or "").strip()
+        node_id_flag = str(getattr(args, "node_id_flag", "") or "").strip()
+        if node_id and node_id_flag and node_id != node_id_flag:
+            die("Conflicting node id: provide positional node_id OR --node-id (not both).")
+        node_id = node_id or node_id_flag
+        if not node_id:
+            die("Missing node_id.")
+
+        payload = node_to_dict(get_node(conn, node_id), include_body=True)
+        out = str(getattr(args, "out", "") or "").strip()
+        if out:
+            out_path = safe_output_path(root, out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+        print_json(payload)
         return 0
     finally:
         conn.close()

@@ -64,7 +64,32 @@ def _leaf_haystack_plain(base_dir: Optional[Path], node: NodeRecord) -> str:
 
 
 def extract_alias_rows(nodes: Sequence[NodeRecord], *, base_dir: Optional[Path] = None) -> List[AliasRecord]:
-    rows: set[AliasRecord] = set()
+    # Deduplicate by the SQLite PK to avoid IntegrityError when multiple sources generate the
+    # same (normalized_alias, target_node_id, alias_level, source_version) tuple.
+    rows_by_key: dict[tuple[str, str, str, str], AliasRecord] = {}
+
+    source_priority = {
+        "frontmatter_alias": 0,
+        "title": 1,
+        "body_alias": 2,
+        "title_abbreviation": 3,
+    }
+
+    def upsert(row: AliasRecord) -> None:
+        key = (row.normalized_alias, row.target_node_id, row.alias_level, row.source_version)
+        cur = rows_by_key.get(key)
+        if cur is None:
+            rows_by_key[key] = row
+            return
+        if row.confidence > cur.confidence + 1e-9:
+            rows_by_key[key] = row
+            return
+        if abs(row.confidence - cur.confidence) <= 1e-9:
+            a = (source_priority.get(row.source, 99), len(row.alias), row.alias)
+            b = (source_priority.get(cur.source, 99), len(cur.alias), cur.alias)
+            if a < b:
+                rows_by_key[key] = row
+
     for node in nodes:
         if not node.is_leaf:
             continue
@@ -73,7 +98,7 @@ def extract_alias_rows(nodes: Sequence[NodeRecord], *, base_dir: Optional[Path] 
             continue
         normalized_title = normalize_alias_text(core_title)
         if normalized_title:
-            rows.add(
+            upsert(
                 AliasRecord(
                     doc_id=node.doc_id,
                     alias=core_title,
@@ -91,7 +116,7 @@ def extract_alias_rows(nodes: Sequence[NodeRecord], *, base_dir: Optional[Path] 
             abbreviation = core_title[0] + core_title[2] + core_title[-2]
             normalized_abbreviation = normalize_alias_text(abbreviation)
             if normalized_abbreviation:
-                rows.add(
+                upsert(
                     AliasRecord(
                         doc_id=node.doc_id,
                         alias=abbreviation,
@@ -108,7 +133,7 @@ def extract_alias_rows(nodes: Sequence[NodeRecord], *, base_dir: Optional[Path] 
         for alias in node.aliases:
             normalized_alias = normalize_alias_text(alias)
             if normalized_alias:
-                rows.add(
+                upsert(
                     AliasRecord(
                         doc_id=node.doc_id,
                         alias=alias,
@@ -129,7 +154,7 @@ def extract_alias_rows(nodes: Sequence[NodeRecord], *, base_dir: Optional[Path] 
             alias = match.group(1).strip()
             normalized_alias = normalize_alias_text(alias)
             if normalized_alias:
-                rows.add(
+                upsert(
                     AliasRecord(
                         doc_id=node.doc_id,
                         alias=alias,
@@ -143,7 +168,7 @@ def extract_alias_rows(nodes: Sequence[NodeRecord], *, base_dir: Optional[Path] 
                     )
                 )
     return sorted(
-        rows,
+        rows_by_key.values(),
         key=lambda row: (row.doc_id, row.source_version, row.normalized_alias, row.target_node_id, row.alias_level),
     )
 

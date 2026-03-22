@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -19,6 +19,35 @@ ARTICLE_LINE_RE = re.compile(
     rf"^\s*第\s*(?P<num>{_CN_NUM_RE})(?:\s*之\s*(?P<zhi>{_CN_NUM_RE}))?\s*[条條]\s*(?P<rest>.*)$"
 )
 ITEM_LINE_RE = re.compile(r"^\s*[（(]\s*(?P<mark>[一二三四五六七八九十0-9]+)\s*[）)]\s*(?P<rest>.*)$")
+
+TOC_DOT_LEADER_RE = re.compile(r"\.{3,}\s*\d+\s*$")
+
+_OUTLINE_NUMSEG_RE = r"\d+[A-Za-z]?"
+_OUTLINE_DECIMAL_ADDR_ANY_RE = rf"{_OUTLINE_NUMSEG_RE}(?:\.{_OUTLINE_NUMSEG_RE})*"
+_OUTLINE_DECIMAL_ADDR_WITH_DOT_RE = rf"{_OUTLINE_NUMSEG_RE}(?:\.{_OUTLINE_NUMSEG_RE})+"
+OUTLINE_CLAUSE_LINE_RE = re.compile(
+    rf"^\s*(?P<addr>(?:NA|[A-Z]{{1,3}})\.{_OUTLINE_DECIMAL_ADDR_ANY_RE}|{_OUTLINE_DECIMAL_ADDR_WITH_DOT_RE})\s+(?P<title>.+?)\s*$"
+)
+OUTLINE_SECTION_LINE_RE = re.compile(r"^\s*(?P<num>\d+)\.\s+(?P<title>.+?)\s*$")
+OUTLINE_SECTION_NO_DOT_LINE_RE = re.compile(r"^\s*(?P<num>\d+)\s{2,}(?P<title>.+?)\s*$")
+_OUTLINE_CAPTION_SEP_RE = r"(?:\s*[:：\-–—]\s*|\s+)"
+OUTLINE_TABLE_LINE_RE = re.compile(
+    rf"^\s*(?P<prefix>table|表)\s*(?P<id>[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*){_OUTLINE_CAPTION_SEP_RE}(?P<title>.*)\s*$",
+    re.IGNORECASE,
+)
+OUTLINE_FIGURE_LINE_RE = re.compile(
+    rf"^\s*(?P<prefix>figure|fig\.?|图)\s*(?P<id>[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*){_OUTLINE_CAPTION_SEP_RE}(?P<title>.*)\s*$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class OutlineHit:
+    kind: str  # clause/table/figure
+    ident: str
+    title: str
+    line_index: int
+    raw_line: str
 
 
 def parse_headings(md: str) -> List[Heading]:
@@ -441,11 +470,689 @@ def _frontmatter(
     return "\n".join(base) + "\n"
 
 
+def _is_paragraph_start(lines: Sequence[str], index: int) -> bool:
+    if index <= 0:
+        return True
+    return lines[index - 1].strip() == ""
+
+
+def _normalize_outline_ident(value: str) -> str:
+    s = unicodedata.normalize("NFKC", str(value or "")).strip()
+    s = re.sub(r"\s+", "", s)
+    out: List[str] = []
+    for ch in s:
+        out.append(ch.upper() if ch.isalpha() else ch)
+    return "".join(out)
+
+
+def _safe_outline_slug(value: str) -> str:
+    s = unicodedata.normalize("NFKC", str(value or "")).strip()
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^0-9A-Za-z._-]+", "_", s)
+    s = s.strip("._-")
+    return s or "x"
+
+
+def _outline_parent_addrs(addr: str) -> List[str]:
+    parts = [p for p in addr.split(".") if p]
+    if len(parts) <= 1:
+        return []
+    out: List[str] = []
+    for i in range(1, len(parts)):
+        out.append(".".join(parts[:i]))
+    return out
+
+
+def detect_structured_outline(md: str) -> Dict[str, Any]:
+    lines = md.splitlines()
+
+    clause_hits: List[OutlineHit] = []
+    table_hits: List[OutlineHit] = []
+    figure_hits: List[OutlineHit] = []
+
+    ignored_toc_lines: List[Dict[str, Any]] = []
+    ignored_dot_leader = 0
+    ignored_outline_list = 0
+    ignored_no_body = 0
+
+    raw_clause_total = 0
+    raw_clause_dupes = 0
+    seen_clause: set[str] = set()
+
+    def next_non_empty_cand(index: int) -> str:
+        j = index + 1
+        while j < len(lines):
+            s = lines[j].strip()
+            if not s:
+                j += 1
+                continue
+            return _strip_markdown_heading_prefix(s)
+        return ""
+
+    def is_outline_marker(cand: str) -> bool:
+        if not cand:
+            return False
+        if TOC_DOT_LEADER_RE.search(cand):
+            return True
+        if OUTLINE_CLAUSE_LINE_RE.match(cand):
+            return True
+        if OUTLINE_SECTION_LINE_RE.match(cand):
+            return True
+        if OUTLINE_SECTION_NO_DOT_LINE_RE.match(cand):
+            return True
+        if OUTLINE_TABLE_LINE_RE.match(cand):
+            return True
+        if OUTLINE_FIGURE_LINE_RE.match(cand):
+            return True
+        return False
+
+    def looks_like_outline_list_entry(index: int) -> bool:
+        nxt = next_non_empty_cand(index)
+        return bool(nxt and is_outline_marker(nxt))
+
+    def looks_like_body_line(cand: str) -> bool:
+        s = str(cand or "").strip()
+        if not s:
+            return False
+        if TOC_DOT_LEADER_RE.search(s):
+            return False
+        if (
+            OUTLINE_CLAUSE_LINE_RE.match(s)
+            or OUTLINE_SECTION_LINE_RE.match(s)
+            or OUTLINE_SECTION_NO_DOT_LINE_RE.match(s)
+            or OUTLINE_TABLE_LINE_RE.match(s)
+            or OUTLINE_FIGURE_LINE_RE.match(s)
+        ):
+            return False
+        if HEADING_RE.match(s):
+            return False
+        if re.fullmatch(r"\d+", s):
+            return False
+        s_lower = s.lower()
+        if "copyright european committee for standardization" in s_lower:
+            return False
+        if "no reproduction or networking permitted" in s_lower:
+            return False
+        if "licensed copy:" in s_lower:
+            return False
+
+        # Ignore lines that start with a long run of non-content characters (common in extracted TOC pages).
+        lead = 0
+        for ch in s:
+            if ch.isalnum() or ("\u3400" <= ch <= "\u9fff"):
+                break
+            lead += 1
+        if lead >= 12:
+            return False
+
+        # Ignore lines that start with mostly punctuation garbage.
+        prefix = s[:40]
+        if re.match(r"^[\\-–—_,，。、\\s]{2,}", prefix):
+            # If the line starts with a long punctuation run and contains no real words early on,
+            # it's almost certainly extraction noise from a contents page.
+            if not re.search(r"[A-Za-z]", prefix) and not re.search(r"[\u3400-\u9fff]", prefix):
+                return False
+
+        if re.match(r"^[（(]\\s*\\d+\\s*[)）]", s):
+            return True
+        if re.match(r"^(note|NOTE)\\b", s):
+            return True
+
+        has_alpha = bool(re.search(r"[A-Za-z]", s))
+        has_cjk = bool(re.search(r"[\u3400-\u9fff]", s))
+        has_lower = bool(re.search(r"[a-z]", s))
+
+        # Headers/TOC noise often contains only uppercase letters + numbers.
+        if not has_lower and not has_cjk and len(s) <= 40:
+            return False
+
+        if len(s) >= 30 and (has_alpha or has_cjk):
+            return True
+        if len(s) >= 20 and has_alpha and " " in s:
+            return True
+        # Some structured standards have very short clause bodies (e.g. "Short text.").
+        # Accept short mixed-case/CJK lines as body, while still rejecting common headers
+        # (filtered above by the uppercase-only heuristic).
+        if (has_alpha or has_cjk) and len(s) >= 8:
+            return True
+        return False
+
+    def clause_has_body(index: int) -> bool:
+        scanned = 0
+        for j in range(index + 1, min(len(lines), index + 160)):
+            cand = _strip_markdown_heading_prefix(lines[j].strip())
+            if not cand:
+                continue
+            if looks_like_body_line(cand):
+                return True
+            scanned += 1
+            if scanned >= 10:
+                break
+        return False
+
+    prev_blank = True
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line:
+            prev_blank = True
+            continue
+
+        is_heading = bool(HEADING_RE.match(line))
+        is_start = prev_blank or is_heading
+        prev_blank = False
+        if not is_start:
+            continue
+
+        cand = _strip_markdown_heading_prefix(line)
+        if not cand:
+            continue
+
+        if TOC_DOT_LEADER_RE.search(cand):
+            ignored_toc_lines.append({"line_index": i, "raw_line": cand})
+            ignored_dot_leader += 1
+            continue
+
+        m_table = OUTLINE_TABLE_LINE_RE.match(cand)
+        if m_table:
+            if looks_like_outline_list_entry(i):
+                ignored_toc_lines.append({"line_index": i, "raw_line": cand})
+                ignored_outline_list += 1
+                continue
+            ident = _normalize_outline_ident(m_table.group("id") or "")
+            title = re.sub(r"\s+", " ", str(m_table.group("title") or "").strip())
+            table_hits.append(
+                OutlineHit(
+                    kind="table",
+                    ident=ident,
+                    title=title or f"Table {ident}",
+                    line_index=i,
+                    raw_line=cand,
+                )
+            )
+            continue
+
+        m_figure = OUTLINE_FIGURE_LINE_RE.match(cand)
+        if m_figure:
+            if looks_like_outline_list_entry(i):
+                ignored_toc_lines.append({"line_index": i, "raw_line": cand})
+                ignored_outline_list += 1
+                continue
+            ident = _normalize_outline_ident(m_figure.group("id") or "")
+            title = re.sub(r"\s+", " ", str(m_figure.group("title") or "").strip())
+            figure_hits.append(
+                OutlineHit(
+                    kind="figure",
+                    ident=ident,
+                    title=title or f"Figure {ident}",
+                    line_index=i,
+                    raw_line=cand,
+                )
+            )
+            continue
+
+        m_clause = OUTLINE_CLAUSE_LINE_RE.match(cand)
+        if m_clause:
+            if looks_like_outline_list_entry(i):
+                ignored_toc_lines.append({"line_index": i, "raw_line": cand})
+                ignored_outline_list += 1
+                continue
+            if not clause_has_body(i):
+                ignored_toc_lines.append({"line_index": i, "raw_line": cand})
+                ignored_no_body += 1
+                continue
+            raw_clause_total += 1
+            addr = _normalize_outline_ident(m_clause.group("addr") or "")
+            title = re.sub(r"\s+", " ", str(m_clause.group("title") or "").strip())
+            if addr in seen_clause:
+                raw_clause_dupes += 1
+                continue
+            seen_clause.add(addr)
+            clause_hits.append(
+                OutlineHit(
+                    kind="clause",
+                    ident=addr,
+                    title=title,
+                    line_index=i,
+                    raw_line=cand,
+                )
+            )
+            continue
+
+    unique_clause_addrs = len({h.ident for h in clause_hits})
+    duplicate_rate = float(raw_clause_dupes) / float(max(1, raw_clause_total))
+
+    suspicious_rate = 0.0
+    suspicious_hits: List[Dict[str, Any]] = []
+
+    should_outline = unique_clause_addrs >= 12 and duplicate_rate <= 0.15 and suspicious_rate <= 0.15
+    mode = "outline" if should_outline else "fallback"
+    reason = ""
+    if not should_outline:
+        reason = (
+            "failed_thresholds:"
+            + f" unique_clause_addrs={unique_clause_addrs} (>=12),"
+            + f" duplicate_rate={duplicate_rate:.3f} (<=0.150),"
+            + f" suspicious_rate={suspicious_rate:.3f} (<=0.150)"
+        )
+
+    return {
+        "mode": mode,
+        "reason": reason,
+        "metrics": {
+            "unique_clause_addrs": unique_clause_addrs,
+            "raw_clause_total": raw_clause_total,
+            "raw_clause_dupes": raw_clause_dupes,
+            "duplicate_rate": duplicate_rate,
+            "suspicious_rate": suspicious_rate,
+            "ignored_toc_lines": len(ignored_toc_lines),
+            "ignored_dot_leader": ignored_dot_leader,
+            "ignored_outline_list": ignored_outline_list,
+            "ignored_no_body": ignored_no_body,
+        },
+        "samples": {
+            "clauses": [h.__dict__ for h in clause_hits[:12]],
+            "tables": [h.__dict__ for h in table_hits[:12]],
+            "figures": [h.__dict__ for h in figure_hits[:12]],
+            "ignored_toc": ignored_toc_lines[:12],
+            "suspicious": suspicious_hits[:12],
+        },
+        "hits": {
+            "clauses": clause_hits,
+            "tables": table_hits,
+            "figures": figure_hits,
+        },
+    }
+
+
+def generate_doc_outline(
+    doc: InputDoc,
+    md: str,
+    out_skill_dir: Path,
+    *,
+    outline: Dict[str, Any],
+) -> Tuple[List[Tuple[str, str, str, str, str, str]], List[NodeRecord]]:
+    doc_dir = out_skill_dir / "references" / doc.doc_id
+    outline_dir = doc_dir / "outline"
+    clauses_dir = outline_dir / "clauses"
+    tables_dir = outline_dir / "tables"
+    figures_dir = outline_dir / "figures"
+
+    clauses_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    write_text(
+        doc_dir / "metadata.md",
+        (
+            f"# {doc.title}\n\n"
+            f"- 源文件：`{doc.path.name}`\n"
+            f"- 版本：`{doc.source_version}`\n"
+            f"- 文档哈希：`{doc.doc_hash}`\n"
+        ),
+    )
+
+    # Audit: structure detection report
+    report_path = doc_dir / "structure_report.json"
+    report_obj = {
+        "doc_id": doc.doc_id,
+        "doc_title": doc.title,
+        "source_file": doc.path.name,
+        "source_version": doc.source_version,
+        "outline": {
+            "mode": outline.get("mode"),
+            "reason": outline.get("reason"),
+            "metrics": outline.get("metrics", {}),
+            "samples": outline.get("samples", {}),
+        },
+    }
+    write_text(report_path, json.dumps(report_obj, ensure_ascii=False, indent=2) + "\n")
+
+    def rel(path: Path) -> str:
+        return str(path.relative_to(out_skill_dir)).replace("\\", "/")
+
+    lines = md.splitlines()
+    clause_hits: List[OutlineHit] = list(outline.get("hits", {}).get("clauses", []))
+    table_hits: List[OutlineHit] = list(outline.get("hits", {}).get("tables", []))
+    figure_hits: List[OutlineHit] = list(outline.get("hits", {}).get("figures", []))
+
+    clause_hits.sort(key=lambda h: h.line_index)
+    table_hits.sort(key=lambda h: h.line_index)
+    figure_hits.sort(key=lambda h: h.line_index)
+
+    nodes: List[NodeRecord] = []
+    nodes_by_id: Dict[str, NodeRecord] = {}
+
+    def ensure_clause_node(addr: str, *, ordinal: int) -> NodeRecord:
+        node_id = f"{doc.doc_id}:clause:{addr}"
+        existing = nodes_by_id.get(node_id)
+        if existing is not None:
+            # Keep the earliest ordinal for stable ordering.
+            existing.ordinal = min(existing.ordinal, ordinal)
+            return existing
+
+        safe = _safe_outline_slug(addr)
+        path = clauses_dir / f"clause-{safe}.md"
+        ref_path = rel(path)
+        title = addr
+        parent_addrs = _outline_parent_addrs(addr)
+        parent_id = f"{doc.doc_id}:clause:{parent_addrs[-1]}" if parent_addrs else None
+
+        node = NodeRecord(
+            node_id=node_id,
+            doc_id=doc.doc_id,
+            doc_title=doc.title,
+            kind="clause",
+            label=addr,
+            title=title,
+            parent_id=parent_id,
+            prev_id=None,
+            next_id=None,
+            ordinal=int(ordinal),
+            ref_path=ref_path,
+            is_leaf=False,
+            body_md="",
+            body_plain="",
+            source_version=doc.source_version,
+            node_hash=stable_hash(""),
+            raw_span_end=1,
+        )
+        nodes_by_id[node_id] = node
+        nodes.append(node)
+        write_text(
+            path,
+            _frontmatter_kb_node(
+                doc,
+                node_id=node_id,
+                kind="clause",
+                label=addr,
+                title=title,
+                parent_id=parent_id or "",
+                ref_path=ref_path,
+            )
+            + f"{title}\n",
+        )
+        return node
+
+    def write_leaf_node(
+        *,
+        node: NodeRecord,
+        path: Path,
+        body_md: str,
+        aliases: Tuple[str, ...] = (),
+    ) -> None:
+        node.is_leaf = True
+        node.aliases = aliases
+        node.node_hash = stable_hash(body_md)
+        node.raw_span_start = 0
+        node.raw_span_end = max(1, len(body_md))
+        write_text(
+            path,
+            _frontmatter_kb_node(
+                doc,
+                node_id=node.node_id,
+                kind=node.kind,
+                label=node.label,
+                title=node.title,
+                parent_id=node.parent_id or "",
+                ref_path=node.ref_path,
+            )
+            + body_md,
+        )
+
+    # Preface block (content before first clause)
+    if clause_hits:
+        first_start = clause_hits[0].line_index
+        preface_lines = _slice_lines(lines, 0, first_start)
+        if preface_lines:
+            preface_body_md = "\n".join(preface_lines).strip() + "\n"
+            preface_node_id = f"{doc.doc_id}:block:preface"
+            preface_path = outline_dir / "preface.md"
+            preface_rel = rel(preface_path)
+            preface_node = NodeRecord(
+                node_id=preface_node_id,
+                doc_id=doc.doc_id,
+                doc_title=doc.title,
+                kind="block",
+                label="preface",
+                title="Preface",
+                parent_id=None,
+                prev_id=None,
+                next_id=None,
+                ordinal=0,
+                ref_path=preface_rel,
+                is_leaf=True,
+                body_md="",
+                body_plain="",
+                source_version=doc.source_version,
+                node_hash=stable_hash(preface_body_md),
+                raw_span_end=max(1, len(preface_body_md)),
+            )
+            preface_node.aliases = ()
+            nodes.append(preface_node)
+            nodes_by_id[preface_node_id] = preface_node
+            write_text(
+                preface_path,
+                _frontmatter_kb_node(
+                    doc,
+                    node_id=preface_node_id,
+                    kind="block",
+                    label="preface",
+                    title="Preface",
+                    parent_id="",
+                    ref_path=preface_rel,
+                )
+                + preface_body_md,
+            )
+
+    # Build clause nodes and extract child tables/figures.
+    for idx, hit in enumerate(clause_hits):
+        addr = _normalize_outline_ident(hit.ident)
+        for p in _outline_parent_addrs(addr):
+            ensure_clause_node(p, ordinal=hit.line_index)
+
+        clause_node = ensure_clause_node(addr, ordinal=hit.line_index)
+
+        start = hit.line_index
+        end = clause_hits[idx + 1].line_index if idx + 1 < len(clause_hits) else len(lines)
+
+        # Gather inner table/figure hits within this clause span
+        inner: List[OutlineHit] = []
+        inner.extend([t for t in table_hits if start <= t.line_index < end])
+        inner.extend([f for f in figure_hits if start <= f.line_index < end])
+        inner.sort(key=lambda h: h.line_index)
+
+        # Extract table/figure bodies and replace in clause body with placeholders.
+        cursor = start
+        clause_body_parts: List[str] = []
+        for inner_hit in inner:
+            inner_start = inner_hit.line_index
+            next_start = end
+            for h2 in inner:
+                if h2.line_index > inner_start:
+                    next_start = min(next_start, h2.line_index)
+                    break
+
+            inner_end = next_start
+            for j in range(inner_start + 1, next_start):
+                if not _is_paragraph_start(lines, j):
+                    continue
+                if re.match(r"^\s*\(\s*\d+\s*\)", _strip_markdown_heading_prefix(lines[j].strip())):
+                    inner_end = j
+                    break
+
+            clause_body_parts.extend(lines[cursor:inner_start])
+            placeholder = f"[Extracted {inner_hit.kind} {inner_hit.ident}]"
+            clause_body_parts.append(placeholder)
+            cursor = inner_end
+
+            inner_body = "\n".join(_slice_lines(lines, inner_start, inner_end)).strip() + "\n"
+            if not inner_body.strip():
+                continue
+
+            if inner_hit.kind == "table":
+                ident = _normalize_outline_ident(inner_hit.ident)
+                node_id = f"{doc.doc_id}:table:{ident}"
+                safe = _safe_outline_slug(ident)
+                path = tables_dir / f"table-{safe}.md"
+                ref_path = rel(path)
+                title = f"Table {ident}"
+                if inner_hit.title and inner_hit.title not in {ident, title}:
+                    title = f"Table {ident}: {inner_hit.title}"
+
+                node = nodes_by_id.get(node_id)
+                if node is None:
+                    node = NodeRecord(
+                        node_id=node_id,
+                        doc_id=doc.doc_id,
+                        doc_title=doc.title,
+                        kind="table",
+                        label=f"Table {ident}",
+                        title=title,
+                        parent_id=clause_node.node_id,
+                        prev_id=None,
+                        next_id=None,
+                        ordinal=int(inner_start),
+                        ref_path=ref_path,
+                        is_leaf=True,
+                        body_md="",
+                        body_plain="",
+                        source_version=doc.source_version,
+                        node_hash=stable_hash(inner_body),
+                        raw_span_end=max(1, len(inner_body)),
+                        aliases=(ident, f"Table {ident}"),
+                    )
+                    nodes_by_id[node_id] = node
+                    nodes.append(node)
+                write_text(
+                    path,
+                    _frontmatter_kb_node(
+                        doc,
+                        node_id=node_id,
+                        kind="table",
+                        label=node.label,
+                        title=title,
+                        parent_id=clause_node.node_id,
+                        ref_path=ref_path,
+                    )
+                    + inner_body,
+                )
+
+            if inner_hit.kind == "figure":
+                ident = _normalize_outline_ident(inner_hit.ident)
+                node_id = f"{doc.doc_id}:figure:{ident}"
+                safe = _safe_outline_slug(ident)
+                path = figures_dir / f"figure-{safe}.md"
+                ref_path = rel(path)
+                title = f"Figure {ident}"
+                if inner_hit.title and inner_hit.title not in {ident, title}:
+                    title = f"Figure {ident}: {inner_hit.title}"
+
+                node = nodes_by_id.get(node_id)
+                if node is None:
+                    node = NodeRecord(
+                        node_id=node_id,
+                        doc_id=doc.doc_id,
+                        doc_title=doc.title,
+                        kind="figure",
+                        label=f"Figure {ident}",
+                        title=title,
+                        parent_id=clause_node.node_id,
+                        prev_id=None,
+                        next_id=None,
+                        ordinal=int(inner_start),
+                        ref_path=ref_path,
+                        is_leaf=True,
+                        body_md="",
+                        body_plain="",
+                        source_version=doc.source_version,
+                        node_hash=stable_hash(inner_body),
+                        raw_span_end=max(1, len(inner_body)),
+                        aliases=(ident, f"Figure {ident}"),
+                    )
+                    nodes_by_id[node_id] = node
+                    nodes.append(node)
+                write_text(
+                    path,
+                    _frontmatter_kb_node(
+                        doc,
+                        node_id=node_id,
+                        kind="figure",
+                        label=node.label,
+                        title=title,
+                        parent_id=clause_node.node_id,
+                        ref_path=ref_path,
+                    )
+                    + inner_body,
+                )
+
+        clause_body_parts.extend(lines[cursor:end])
+        clause_body = "\n".join(_slice_lines(clause_body_parts, 0, len(clause_body_parts))).strip() + "\n"
+
+        # Update clause node with real title + body.
+        clause_title = f"{addr} {hit.title}".strip()
+        clause_node.title = clause_title
+        clause_node.label = addr
+        clause_node.kind = "clause"
+        clause_node.is_leaf = True
+        clause_node.aliases = (addr,)
+        clause_node.node_hash = stable_hash(clause_body)
+        clause_node.raw_span_start = 0
+        clause_node.raw_span_end = max(1, len(clause_body))
+        clause_path = out_skill_dir / clause_node.ref_path
+        write_text(
+            clause_path,
+            _frontmatter_kb_node(
+                doc,
+                node_id=clause_node.node_id,
+                kind="clause",
+                label=addr,
+                title=clause_title,
+                parent_id=clause_node.parent_id or "",
+                ref_path=clause_node.ref_path,
+            )
+            + clause_body,
+        )
+
+    # Link siblings (across kinds) deterministically by ordinal then node_id.
+    by_parent: Dict[Tuple[str, Optional[str]], List[NodeRecord]] = {}
+    for n in nodes:
+        by_parent.setdefault((n.doc_id, n.parent_id), []).append(n)
+    for siblings in by_parent.values():
+        siblings.sort(key=lambda x: (x.ordinal, x.node_id))
+        for s_idx, cur in enumerate(siblings):
+            cur.prev_id = siblings[s_idx - 1].node_id if s_idx > 0 else None
+            cur.next_id = siblings[s_idx + 1].node_id if s_idx + 1 < len(siblings) else None
+
+    toc_lines: List[str] = [
+        f"# {doc.title} 目录\n\n",
+        "## Outline\n\n",
+        f"- mode: `{outline.get('mode')}`\n",
+        f"- clauses: {len([n for n in nodes if n.kind == 'clause'])}\n",
+        f"- tables: {len([n for n in nodes if n.kind == 'table'])}\n",
+        f"- figures: {len([n for n in nodes if n.kind == 'figure'])}\n\n",
+        "## Nodes\n\n",
+        "| kind | node_id | title | file |\n|---|---|---|---|\n",
+    ]
+    for n in sorted(nodes, key=lambda r: (r.kind, r.node_id)):
+        toc_lines.append(f"| `{n.kind}` | `{n.node_id}` | {n.title} | `{n.ref_path}` |\n")
+    write_text(doc_dir / "toc.md", "".join(toc_lines))
+
+    heading_rows: List[Tuple[str, str, str, str, str, str]] = [
+        (n.title, doc.doc_id, doc.title, n.kind, n.node_id, n.ref_path) for n in nodes if n.ref_path
+    ]
+
+    return heading_rows, nodes
+
+
 def generate_doc(
     doc: InputDoc,
     md: str,
     out_skill_dir: Path,
 ) -> Tuple[List[Tuple[str, str, str, str, str, str]], List[NodeRecord]]:
+    outline = detect_structured_outline(md)
+    if str(outline.get("mode")) == "outline":
+        return generate_doc_outline(doc, md, out_skill_dir, outline=outline)
+
     doc_dir = out_skill_dir / "references" / doc.doc_id
     chapters_dir = doc_dir / "chapters"
     sections_root = doc_dir / "sections"
