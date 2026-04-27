@@ -1,23 +1,29 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
-import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import List, Optional
 
 from . import templates_dir
-from .fs_utils import die, platform_tag, write_text
-from .text_utils import stable_hash
+from .utils.fs import BuildError, platform_tag, write_text
+from .utils.text import stable_hash
+from .utils.safe_subprocess import run_subprocess_safe
+
+# Binaries bundled with pack-builder for precise search (rg, fd)
+_PACK_BUILDER_DIR = Path(__file__).resolve().parents[2]  # pack-builder root
+_BUNDLED_BIN_DIR = _PACK_BUILDER_DIR / "bin"
+
+logger = logging.getLogger(__name__)
 
 
 def write_reindex_script(out_skill_dir: Path) -> None:
     script_path = out_skill_dir / "scripts" / "reindex.py"
     template = templates_dir() / "reindex.py"
     if not template.exists():
-        die("Missing template: templates/reindex.py (pack-builder installation is incomplete)")
+        raise BuildError("Missing asset: templates/reindex.py (pack-builder installation is incomplete)")
     write_text(script_path, template.read_text(encoding="utf-8"))
     script_path.chmod(0o755)
 
@@ -26,13 +32,13 @@ def write_kbtool_script(out_skill_dir: Path) -> None:
     script_path = out_skill_dir / "scripts" / "kbtool.py"
     template = templates_dir() / "kbtool.py"
     if not template.exists():
-        die("Missing template: templates/kbtool.py (pack-builder installation is incomplete)")
+        raise BuildError("Missing asset: templates/kbtool.py (pack-builder installation is incomplete)")
     write_text(script_path, template.read_text(encoding="utf-8"))
     script_path.chmod(0o755)
 
     lib_src = templates_dir() / "kbtool_lib"
     if not lib_src.exists():
-        die("Missing template: templates/kbtool_lib/ (pack-builder installation is incomplete)")
+        raise BuildError("Missing asset: templates/kbtool_lib/ (pack-builder installation is incomplete)")
     lib_dst = out_skill_dir / "scripts" / "kbtool_lib"
     if lib_dst.exists():
         shutil.rmtree(lib_dst)
@@ -48,14 +54,14 @@ def write_kbtool_sha1(out_skill_dir: Path) -> str:
     script_path = scripts_dir / "kbtool.py"
     lib_dir = scripts_dir / "kbtool_lib"
     if not script_path.exists():
-        die(f"Missing kbtool.py for hashing: {script_path}")
+        raise BuildError(f"Missing asset: kbtool.py for hashing: {script_path}")
     if not lib_dir.exists():
-        die(f"Missing kbtool_lib/ for hashing: {lib_dir}")
+        raise BuildError(f"Missing asset: kbtool_lib/ for hashing: {lib_dir}")
 
     sources: List[Path] = [script_path]
     sources.extend(sorted((p for p in lib_dir.rglob("*.py") if p.is_file()), key=lambda p: p.as_posix()))
     if not sources:
-        die(f"Empty kbtool sources for hashing under: {scripts_dir}")
+        raise BuildError(f"Missing asset: empty kbtool sources for hashing under: {scripts_dir}")
 
     # Cross-platform stable hash: hash normalized text per file (universal newlines), then hash the path+hash list.
     h = hashlib.sha1()
@@ -211,12 +217,12 @@ exit /b 2
 def maybe_package_kbtool_pyinstaller(out_skill_dir: Path) -> Optional[Path]:
     pyinstaller = shutil.which("pyinstaller")
     if not pyinstaller:
-        print("[WARN] PyInstaller not found on PATH; skipping --package-kbtool.", file=sys.stderr)
+        logger.warning("PyInstaller not found on PATH; skipping --package-kbtool.")
         return None
 
     script_path = out_skill_dir / "scripts" / "kbtool.py"
     if not script_path.exists():
-        die(f"Missing kbtool.py for packaging: {script_path}")
+        raise BuildError(f"Missing asset: kbtool.py for packaging: {script_path}")
 
     tag = platform_tag()
     dist_dir = out_skill_dir / "bin" / tag
@@ -229,7 +235,7 @@ def maybe_package_kbtool_pyinstaller(out_skill_dir: Path) -> Optional[Path]:
         spec_path = tmp_path / "spec"
         work_path.mkdir(parents=True, exist_ok=True)
         spec_path.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
+        proc = run_subprocess_safe(
             [
                 pyinstaller,
                 "--onefile",
@@ -245,13 +251,14 @@ def maybe_package_kbtool_pyinstaller(out_skill_dir: Path) -> Optional[Path]:
                 str(spec_path),
                 str(script_path),
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            timeout=600.0,
+            max_output_bytes=64 * 1024 * 1024,  # PyInstaller output can be verbose
             check=False,
+            text=True,
         )
         if proc.returncode != 0:
-            die(f"PyInstaller failed:\n{proc.stdout}")
+            logger.error("PyInstaller failed:\n%s", proc.stdout)
+            return None
 
     exe = dist_dir / (name + (".exe" if tag.startswith("windows-") else ""))
     if exe.exists():
@@ -259,3 +266,41 @@ def maybe_package_kbtool_pyinstaller(out_skill_dir: Path) -> Optional[Path]:
     candidates = sorted(dist_dir.glob(name + "*"), key=lambda p: p.name)
     return candidates[0] if candidates else None
 
+
+def copy_search_binaries(out_skill_dir: Path) -> None:
+    """Copy bundled search binaries (rg, fd) to generated skill's bin/ directory.
+
+    These enable the kbtool grep/locate subcommands for precise search.
+    Uses copy (not symlink) for portability across machines.
+    """
+    if not _BUNDLED_BIN_DIR.exists():
+        logger.info("No bundled bin/ directory found, skipping search binary copy.")
+        return
+
+    dest_bin = out_skill_dir / "bin"
+    dest_bin.mkdir(parents=True, exist_ok=True)
+
+    copied_any = False
+    for tool_name in ("rg", "fd"):
+        src = _BUNDLED_BIN_DIR / tool_name
+        if not src.is_file():
+            logger.info("Bundled %s not found, skipping.", tool_name)
+            continue
+        dst = dest_bin / tool_name
+        if dst.exists():
+            dst.unlink()
+        shutil.copy2(src, dst)
+        dst.chmod(0o755)
+        logger.info("Copied search binary: %s -> %s", src.name, dst)
+        copied_any = True
+
+    if copied_any:
+        notice_src = _PACK_BUILDER_DIR / "THIRD_PARTY_NOTICES.md"
+        if notice_src.is_file():
+            shutil.copy2(notice_src, out_skill_dir / "THIRD_PARTY_NOTICES.md")
+        third_party_src = _PACK_BUILDER_DIR / "third_party"
+        if third_party_src.is_dir():
+            third_party_dst = out_skill_dir / "third_party"
+            if third_party_dst.exists():
+                shutil.rmtree(third_party_dst)
+            shutil.copytree(third_party_src, third_party_dst)

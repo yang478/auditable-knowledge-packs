@@ -6,7 +6,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]  # pack-builder/scripts
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from build_skill_lib import templates_dir  # noqa: E402
-from build_skill_lib import text_utils as build_text  # noqa: E402
+import build_skill_lib.utils.text as build_text  # noqa: E402
 from build_skill_lib.types import AliasRecord, EdgeRecord, NodeRecord  # noqa: E402
 
 TEMPLATES_DIR = templates_dir()
@@ -35,7 +35,7 @@ class ConsistencyTests(unittest.TestCase):
 
         node_row_fields = set(node_row.__dataclass_fields__.keys())
         node_record_fields = set(NodeRecord.__dataclass_fields__.keys())
-        self.assertEqual(node_record_fields - node_row_fields, {"doc_title"})
+        self.assertEqual(node_record_fields - node_row_fields, {"doc_title", "heading_path"})
         self.assertEqual(node_row_fields - node_record_fields, set())
 
         edge_row_fields = set(edge_row.__dataclass_fields__.keys())

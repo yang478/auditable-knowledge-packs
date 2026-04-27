@@ -2,9 +2,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 _WINDOWS_INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
 _WINDOWS_RESERVED_NAMES = {
@@ -113,6 +116,7 @@ def _write_sharded_index(root: Path, index_name: str, rows: List[Tuple[str, ...]
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     root = Path(__file__).resolve().parents[1]
     refs = root / "references"
 
@@ -149,10 +153,9 @@ def main() -> int:
     kw_rows.sort(key=lambda r: r[0])
     _write_sharded_index(root, "kw", kw_rows, ("keyword", "doc_id", "doc_title", "type", "id", "path"))
 
-    print("[OK] Rebuilt sharded indexes under", root / "indexes")
+    logger.info("Rebuilt sharded indexes under %s", root / "indexes")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

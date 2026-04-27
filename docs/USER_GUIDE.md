@@ -10,10 +10,10 @@ This guide explains how to generate a knowledge-base skill from documents, and h
   - `kbtool` / `kbtool.cmd`: recommended entrypoints (prefer a fresh matching binary, fall back to Python)
   - `scripts/kbtool.py` + `scripts/kbtool_lib/`: deterministic CLI implementation used at query time
   - (Optional) `bin/<platform>/kbtool(.exe)`: PyInstaller packaged single-file executable (no Python required)
-- **Deterministic research round**: instead of letting an LLM assemble context itself, you run `kbtool research` to produce:
-  - `run_dir/bundle.roundNN.md` (evidence + citations + answering constraints)
-  - `run_dir/trace.roundNN.json` + `run_dir/verify.roundNN.json` + append-only `run_dir/trace.jsonl`
-  - stdout JSON for the LLM to decide the *next* round query/params
+- **Deterministic Phase A research run**: instead of letting an LLM assemble context itself, you run `kbtool research` to produce:
+  - `run_dir/bundle.json` (machine-readable retrieval state)
+  - `run_dir/bundle.md` (human-readable evidence for answering)
+  - stdout JSON with `run_dir`, `paths.bundle_json`, and `paths.bundle_md`
 
 ## Requirements
 
@@ -62,41 +62,45 @@ IR v1 supports `type=doc` and `type=node` rows. Recommended node kinds: `article
 
 ```bash
 cd .claude/skills/my-books
-./kbtool search --query "质量保证期限" --out search.md
-# Or (python): python3 scripts/kbtool.py search --query "质量保证期限" --out search.md
-# Or (binary): bin/<platform>/kbtool search --query "质量保证期限" --out search.md
+./kbtool search --pattern "质量保证期限" --out search.md
+# (Optional) Literal match: ./kbtool search --pattern "a.b" --fixed
+# Or (python): python3 scripts/kbtool.py search --pattern "质量保证期限" --out search.md
+# Or (binary): bin/<platform>/kbtool search --pattern "质量保证期限" --out search.md
 ```
 
 ## Research (recommended path)
 
-`research` performs **deterministic iterative search (≤5 rounds) → expand → budgeted rendering → verify** and writes one round of auditable artifacts.
+`research` performs **deterministic iterative search (≤5 rounds) → expand → budgeted rendering** and writes one bounded Phase A result.
 
 ```bash
 cd .claude/skills/my-books
 ./kbtool research \
   --query "适用范围是什么？" \
-  --run-dir research_runs/case-001 \
-  --planner-json '{"model":"gpt-5","temperature":0.2,"prompt_sha256":"..."}'
-# Or (python): python3 scripts/kbtool.py research --query "..." --run-dir research_runs/case-001 --planner-json '{...}'
-# Or (binary): bin/<platform>/kbtool research --query "..." --run-dir research_runs/case-001 --planner-json '{...}'
+  --run-dir research_runs/case-001
+# Or (python): python3 scripts/kbtool.py research --query "..." --run-dir research_runs/case-001
+# Or (binary): bin/<platform>/kbtool research --query "..." --run-dir research_runs/case-001
 ```
 
 Audit note:
-- `bundle.roundNN.md` includes a `## 检索轨迹` section (and an “Evidence-only” contract at the top).
-- No LLM calls are involved in retrieval; the LLM only decides whether to run the *next* round and what params to use.
-- `--planner-json` is part of the audit trail. Minimum recommended keys: `{model, temperature, prompt_sha256}` (or use `prompt_path`).
-  - If you provide `prompt_path` (file) or `prompt` (string) in `planner-json`, kbtool will copy the prompt into `run_dir/` and compute `prompt_sha256`.
+- `bundle.md` includes `## Search Goal`, `## Coverage Assessment`, `## Answerability Assessment`, `## Probe Trace`, `## Round Decision`, `## Evidence`, and `## References`.
+- `bundle.json` is the LLM-facing v2 payload rooted in `search_goal`, `coverage_assessment`, `answerability_assessment`, `probe_trace`, `evidence_items`, and `round_decision`.
+- `trace.roundNN.json` and `verify.roundNN.json` are written alongside the bundle for round-level audit details and machine checks.
+- No LLM calls are involved in retrieval; the LLM only answers from the emitted bundle.
+- `--planner-json` is accepted for compatibility, but the authoritative Phase A audit artifacts are `trace.roundNN.json` and `verify.roundNN.json` rather than a separate planner payload.
 - For safety, `--run-dir` must be within the skill root (path traversal / absolute paths outside root are refused).
 
 Common options:
 - `--run-dir research_runs/case-001`: where round artifacts are written.
-- `--round 0`: 0 = auto-increment (recommended); set a number to force.
-- `--note "..."`: free-form note stored in trace.
+- `--round 0`: reserved for compatibility and ignored by the Phase A contract.
+- `--note "..."`: reserved for compatibility with older wrappers.
 - `--neighbors 1`: include previous/next leaf nodes under the same parent.
 - `--max-chars 40000`: total output budget.
 - `--per-node-max-chars 6000`: truncate a single node if it’s too long.
 - `--query-mode and|or`: compose the FTS query more strictly/loosely.
-- `--must TERM` (repeatable): terms that must appear (used as additional constraints). If a term looks like a doc code and matches a `doc_id`, it is treated as a doc hint (filters/prioritizes that document) instead of a “text must appear” constraint.
+- `--focus-doc DOC` (repeatable): first-class document focus control by `doc_id` or title substring.
+- `--require-term TERM` (repeatable): lexical term that must appear in matched text.
+- `--exclude-term TERM` (repeatable): lexical term that must not appear in matched text.
+- `--doc-scope DOC` (repeatable): operational/manual document restriction by `doc_id` or title substring.
 - `--timeout-ms 2000`: abort SQLite queries if they exceed this duration (0 = disabled).
 - Iterative retrieval knobs:
   - `--iter-max-rounds 3`: cap iterative refinement rounds (1 = single-pass).
@@ -106,7 +110,7 @@ Common options:
 - `--debug-triggers`: emit diagnostics and one-hop reference expansion.
 - `--enable-hooks`: enable runtime hooks from `hooks/` (see below).
 
-If verify fails (`ok=false` in stdout JSON), revise query/params and run the NEXT round in the same `--run-dir` (omit `--round` to auto-increment). `verify.roundNN.json` includes `suggested_next_params` to help automation.
+If you rerun `research` with the same `--run-dir`, `bundle.json`, `bundle.md`, and the current round's `trace.roundNN.json` / `verify.roundNN.json` are overwritten. Use a new `--run-dir` when you want to keep multiple attempts side by side.
 
 ## Atomic commands (JSON output)
 
@@ -130,12 +134,18 @@ Create `hooks/` under the generated skill root and add any of:
 
 Each file must export `run(payload: dict) -> dict`. Hooks only run when you pass `--enable-hooks` to `search`/`research`.
 If `hooks/allowlist.sha1` exists, kbtool will only execute hooks whose sha1 is listed (one per line).
+`pre_search` may rewrite `query`, `query_mode`, `doc_scope`, `require_terms`, `exclude_terms`, `doc_hints`, and `query_variants`.
 
 ## Answering with provenance
 
-Open `bundle.roundNN.md` and answer **only** based on its contents.
+Open `bundle.md` and answer **only** based on its contents.
 
-At the bottom, the tool appends a references section (paths into `references/`). Keep it when you quote or summarize content.
+At the bottom, the tool appends a `## References` section (paths into `references/`). Keep it when you quote or summarize content.
+
+When deciding whether to stop searching, do not treat coverage alone as success:
+- `coverage_assessment` tells you whether the right topic/facets were covered.
+- `answerability_assessment` tells you whether the current evidence can directly answer the requested question shape.
+- `probe_trace` tells you whether runtime had to keep searching after a navigation/pattern hit.
 
 ## Editing references and reindexing
 
@@ -154,4 +164,4 @@ The reindex path uses a “shadow rebuild + atomic switch” approach to reduce 
 
 - PDF import fails: ensure `pdftotext` exists; otherwise convert PDF → TXT/MD first.
 - Too much output: lower `--max-chars` or `--per-node-max-chars`.
-- No results: try `search` first, simplify query terms, or use `--query-mode and` with `--must` constraints.
+- No results: try `search` first, simplify query terms, or narrow with `--focus-doc`, `--require-term`, `--exclude-term`, and `--query-mode and`.

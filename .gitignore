@@ -35,3 +35,8 @@ SECURITY.md
 测试文档/
 newproject/
 reference_project/
+构建测试/
+# Local graph prototypes
+test_graph.db*
+test_graph.py
+pack-builder/.github/

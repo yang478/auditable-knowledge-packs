@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sqlite3
+from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
-from .runtime import die, resolve_root
+from . import artifact_contract, state_contract
+from .canonical_text import canonical_text_sha256, normalize_canonical_text
+from .fingerprint_core import sha256_bytes as _sha256_bytes, sha256_text as _sha256_text
+from .runtime import die, resolve_db_path, resolve_root
+from .safe_sqlite import enable_wal
+
+logger = logging.getLogger(__name__)
 from .text import (
     core_alias_title,
     derive_source_version,
+    extract_keywords,
     fts_tokens,
     markdown_to_plain,
     node_key,
@@ -47,8 +56,8 @@ class NodeRow:
     confidence: float = 1.0
 
     def __post_init__(self) -> None:
-        if not self.raw_span_end:
-            self.raw_span_end = max(1, len(self.body_md))
+        if self.raw_span_end == 0:
+            self.raw_span_end = len(self.body_md)
         if not self.node_hash:
             self.node_hash = stable_hash(self.body_md)
 
@@ -65,6 +74,7 @@ class DocRow:
     source_path: str
     doc_hash: str = ""
     source_version: str = "current"
+    active_parser: str = ""
     is_active: bool = True
 
 
@@ -92,6 +102,48 @@ class AliasRow:
     is_active: bool = True
 
 
+@dataclass(frozen=True)
+class RefreshResult:
+    dirty_doc_ids: Tuple[str, ...]
+    refreshed_indexes: Tuple[str, ...]
+    rewritten_rows: int
+    full_rewrite_rows: int
+    uses_atomic_activation: bool = True
+
+
+def _parse_bool_robust(value: object, default: bool = True) -> bool:
+    """Parse boolean from various frontmatter formats."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("true", "yes", "1"):
+        return True
+    if s in ("false", "no", "0", ""):
+        return False
+    return default
+
+
+def _safe_canonical_version(source_version: str) -> str:
+    value = re.sub(r"[^0-9A-Za-z._-]+", "-", str(source_version or "current")).strip("-")
+    return value or "current"
+
+
+def canonical_text_rel_path(doc_id: str, source_version: str) -> str:
+    return f"canonical_text/{doc_id}--{_safe_canonical_version(source_version)}.txt"
+
+
+def _safe_join_under(root: Path, rel_path: str) -> Path:
+    root_resolved = root.resolve()
+    path = (root / rel_path).resolve()
+    try:
+        path.relative_to(root_resolved)
+    except ValueError:
+        die(f"Invalid ref_path outside skill root: {rel_path!r}")
+    return path
+
+
 def hash_doc_dir(doc_dir: Path) -> str:
     parts: List[str] = []
     for path in sorted(p for p in doc_dir.rglob("*.md") if p.is_file()):
@@ -108,6 +160,9 @@ _REFERENCE_PATTERNS = (
 ALIAS_EXACT = "exact"
 ALIAS_ABBREVIATION = "abbreviation"
 ALIAS_SOFT = "soft"
+PHASE_A_ARTIFACT_EXPORT = artifact_contract.PHASE_A_ARTIFACT_EXPORT
+BUILD_STATE_FILENAME = state_contract.BUILD_STATE_FILENAME
+ARTIFACT_VERSION = "kbtool.artifact.v1"
 
 
 def extract_alias_rows(nodes: Sequence[NodeRow]) -> List[AliasRow]:
@@ -182,9 +237,7 @@ def extract_alias_rows(nodes: Sequence[NodeRow]) -> List[AliasRow]:
 
 def extract_reference_edges(nodes: Sequence[NodeRow]) -> List[EdgeRow]:
     article_targets = {
-        (node.doc_id, normalize_article_ref(node.label)): node.node_id
-        for node in nodes
-        if node.kind == "article"
+        (node.doc_id, normalize_article_ref(node.label)): node.node_id for node in nodes if node.kind == "article"
     }
     edges: set[EdgeRow] = set()
     for node in nodes:
@@ -216,14 +269,14 @@ def extract_reference_edges(nodes: Sequence[NodeRow]) -> List[EdgeRow]:
     )
 
 
-def parse_doc_metadata(doc_dir: Path) -> Tuple[str, str, str, str]:
+def parse_doc_metadata(doc_dir: Path) -> Tuple[str, str, str, str, str, str]:
     """
     Best-effort doc_title + source_file from references/<doc_id>/metadata.md.
     """
     md_path = doc_dir / "metadata.md"
     if not md_path.exists():
         title = doc_dir.name
-        return title, "(unknown)", derive_source_version(doc_dir.name, title), hash_doc_dir(doc_dir)
+        return title, "(unknown)", str(doc_dir), derive_source_version(doc_dir.name, title), hash_doc_dir(doc_dir), ""
     md = md_path.read_text(encoding="utf-8", errors="replace")
     title = doc_dir.name
     for line in md.splitlines():
@@ -231,12 +284,16 @@ def parse_doc_metadata(doc_dir: Path) -> Tuple[str, str, str, str]:
             title = line[2:].strip() or title
             break
     m = re.search(r"源文件：`([^`]+)`", md)
+    source_path_match = re.search(r"源路径：`([^`]+)`", md)
     source_file = m.group(1) if m else "(unknown)"
     version_match = re.search(r"版本：`([^`]+)`", md)
     doc_hash_match = re.search(r"文档哈希：`([^`]+)`", md)
+    parser_match = re.search(r"解析器：`([^`]+)`", md)
+    source_path = source_path_match.group(1) if source_path_match else str(doc_dir)
     source_version = version_match.group(1) if version_match else derive_source_version(doc_dir.name, title)
     doc_hash = doc_hash_match.group(1) if doc_hash_match else hash_doc_dir(doc_dir)
-    return title, source_file, source_version, doc_hash
+    active_parser = parser_match.group(1) if parser_match else ""
+    return title, source_file, source_path, source_version, doc_hash, active_parser
 
 
 def read_md_with_frontmatter(path: Path) -> Tuple[Dict[str, str], str]:
@@ -290,15 +347,16 @@ def build_nodes_from_references(root: Path) -> Tuple[List[DocRow], List[NodeRow]
     # Load documents
     for doc_dir in sorted((p for p in refs_dir.iterdir() if p.is_dir()), key=lambda p: p.name):
         doc_id = doc_dir.name
-        doc_title, source_file, source_version, doc_hash = parse_doc_metadata(doc_dir)
+        doc_title, source_file, source_path, source_version, doc_hash, active_parser = parse_doc_metadata(doc_dir)
         docs.append(
             DocRow(
                 doc_id=doc_id,
                 doc_title=doc_title,
                 source_file=source_file,
-                source_path=str(doc_dir),
+                source_path=source_path,
                 source_version=source_version,
                 doc_hash=doc_hash,
+                active_parser=active_parser,
                 is_active=True,
             )
         )
@@ -316,7 +374,7 @@ def build_nodes_from_references(root: Path) -> Tuple[List[DocRow], List[NodeRow]
             parent_id = str(fm.get("parent_id") or "").strip() or None
             node_id = str(fm.get("node_id") or "").strip() or f"{doc_id}:{kind}:{md.stem}"
             ordinal = parse_int_suffix(md.stem, default=0)
-            is_leaf = bool(int(str(fm.get("is_leaf") or "1")))
+            is_leaf = _parse_bool_robust(fm.get("is_leaf"), default=True)
             aliases = parse_aliases_field(fm.get("aliases", ""))
             doc_nodes.append(
                 NodeRow(
@@ -426,7 +484,7 @@ def build_nodes_from_references(root: Path) -> Tuple[List[DocRow], List[NodeRow]
                 n.body_md = ""
                 n.body_plain = ""
                 n.raw_span_start = 0
-                n.raw_span_end = 1
+                n.raw_span_end = 0
                 n.node_hash = stable_hash("")
 
         # Rebuild stable prev/next links for siblings when absent.
@@ -446,6 +504,600 @@ def build_nodes_from_references(root: Path) -> Tuple[List[DocRow], List[NodeRow]
     return docs, nodes
 
 
+def _load_existing_source_paths(root: Path) -> Dict[Tuple[str, str], str]:
+    out: Dict[Tuple[str, str], str] = {}
+    for manifest_name in ("corpus_manifest.json", "manifest.json"):
+        manifest_path = root / manifest_name
+        if not manifest_path.exists():
+            continue
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        docs = data.get("docs")
+        if not isinstance(docs, list):
+            continue
+        for row in docs:
+            if not isinstance(row, dict):
+                continue
+            doc_id = str(row.get("doc_id") or "").strip()
+            source_version = str(row.get("source_version") or "current").strip() or "current"
+            source_path = str(row.get("source_path") or "").strip()
+            if not doc_id or not source_path:
+                continue
+            out[(doc_id, source_version)] = source_path
+            out.setdefault((doc_id, ""), source_path)
+    return out
+
+
+def _load_existing_corpus_title(root: Path) -> str:
+    for manifest_name in ("corpus_manifest.json", "manifest.json"):
+        manifest_path = root / manifest_name
+        if not manifest_path.exists():
+            continue
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        title = str(data.get("title") or "").strip()
+        if title:
+            return title
+    return root.name
+
+
+def _document_row_footprint(doc_state: Dict[str, object]) -> int:
+    span_fingerprints = doc_state.get("span_fingerprints", {})
+    node_fingerprints = doc_state.get("node_fingerprints", {})
+    span_count = len(span_fingerprints) if isinstance(span_fingerprints, dict) else 0
+    node_count = len(node_fingerprints) if isinstance(node_fingerprints, dict) else 0
+    return max(1, 1 + span_count + node_count)
+
+
+def _summarize_incremental_refresh(
+    previous_state: Dict[str, object], current_state: Dict[str, object]
+) -> RefreshResult:
+    previous_docs = previous_state.get("documents", {})
+    current_docs = current_state.get("documents", {})
+    previous_map = previous_docs if isinstance(previous_docs, dict) else {}
+    current_map = current_docs if isinstance(current_docs, dict) else {}
+
+    dirty_doc_ids: List[str] = []
+    for doc_id in sorted(set(previous_map.keys()) | set(current_map.keys())):
+        if previous_map.get(doc_id) != current_map.get(doc_id):
+            dirty_doc_ids.append(str(doc_id))
+
+    full_rewrite_rows = sum(_document_row_footprint(doc) for doc in previous_map.values() if isinstance(doc, dict))
+    if not full_rewrite_rows:
+        full_rewrite_rows = sum(_document_row_footprint(doc) for doc in current_map.values() if isinstance(doc, dict))
+    full_rewrite_rows = max(1, full_rewrite_rows)
+
+    rewritten_rows = sum(_document_row_footprint(current_map.get(doc_id, {})) for doc_id in dirty_doc_ids)
+    if dirty_doc_ids:
+        rewritten_rows = max(1, rewritten_rows)
+
+    refreshed_indexes: List[str] = []
+    if dirty_doc_ids:
+        refreshed_indexes.extend(["sqlite", "fts", "aliases", "edges"])
+
+    return RefreshResult(
+        dirty_doc_ids=tuple(dirty_doc_ids),
+        refreshed_indexes=tuple(refreshed_indexes),
+        rewritten_rows=rewritten_rows,
+        full_rewrite_rows=full_rewrite_rows,
+        uses_atomic_activation=True,
+    )
+
+
+def _load_existing_corpus_docs(root: Path) -> Dict[Tuple[str, str], Dict[str, object]]:
+    manifest_path = root / "corpus_manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+    docs = data.get("docs")
+    if not isinstance(docs, list):
+        return {}
+
+    out: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for row in docs:
+        if not isinstance(row, dict):
+            continue
+        doc_id = str(row.get("doc_id") or "").strip()
+        source_version = str(row.get("source_version") or "current").strip() or "current"
+        if not doc_id:
+            continue
+        out[(doc_id, source_version)] = {
+            "title": str(row.get("title") or ""),
+            "source_file": str(row.get("source_file") or ""),
+            "source_path": str(row.get("source_path") or ""),
+            "doc_hash": str(row.get("doc_hash") or ""),
+            "active_version": bool(row.get("active_version", row.get("is_active", True))),
+            "canonical_text_path": str(row.get("canonical_text_path") or ""),
+            "canonical_text_sha256": str(row.get("canonical_text_sha256") or ""),
+        }
+    return out
+
+
+def _read_json(path: Path) -> Dict[str, object]:
+    return state_contract.read_json(path)
+
+
+def _read_ref_body(root: Path, rel_path: str) -> str:
+    path = _safe_join_under(root, rel_path)
+    md = path.read_text(encoding="utf-8", errors="replace")
+    body = strip_frontmatter(md)
+    return body.strip() + "\n" if body.strip() else ""
+
+
+def _node_body_md(root: Path, node: NodeRow) -> str:
+    body = node.body_md
+    if not body and node.ref_path:
+        body = _read_ref_body(root, node.ref_path)
+    return body.strip() + "\n" if body.strip() else ""
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
+def _container_prefix(container_body: str, first_child_body: str) -> str:
+    container = container_body.strip()
+    child = first_child_body.strip()
+    if not container or not child:
+        return ""
+
+    idx = container.find(child)
+    if idx >= 0:
+        prefix = container[:idx].strip()
+        return prefix
+
+    child_anchor = _first_nonempty_line(child)
+    if not child_anchor:
+        return ""
+    idx = container.find(child_anchor)
+    if idx >= 0:
+        prefix = container[:idx].strip()
+        return prefix
+    return ""
+
+
+def _sort_nodes(nodes: Sequence[NodeRow]) -> List[NodeRow]:
+    return sorted(nodes, key=lambda node: (node.ordinal, node.ref_path, node.node_id))
+
+
+def _render_canonical_node(
+    root: Path,
+    node: NodeRow,
+    *,
+    children_by_parent: Dict[str, List[NodeRow]],
+) -> str:
+    """Render a canonical node and its children using explicit stack (iterative DFS).
+
+    Avoids recursion depth limits for deeply nested documents (e.g. legal texts).
+    """
+    direct_children = [child for child in children_by_parent.get(node.node_id, []) if child.kind != "item"]
+    if not direct_children:
+        return _node_body_md(root, node).strip()
+
+    # Stack holds (node, state) where state is False=enter, True=exit(after children)
+    stack: List[tuple[NodeRow, bool]] = [(node, False)]
+    # Map node_id -> list of rendered parts for that node
+    rendered_map: Dict[str, List[str]] = {}
+
+    while stack:
+        cur, processed = stack.pop()
+        if processed:
+            # Assemble this node's rendered text from its children
+            cur_children = [c for c in children_by_parent.get(cur.node_id, []) if c.kind != "item"]
+            parts: List[str] = []
+            container_body = _node_body_md(root, cur)
+            if cur_children:
+                first_child_body = _node_body_md(root, cur_children[0])
+                prefix = _container_prefix(container_body, first_child_body)
+                if prefix:
+                    parts.append(prefix)
+                for child in cur_children:
+                    child_rendered = rendered_map.pop(child.node_id, [])
+                    text = "\n\n".join(child_rendered).strip()
+                    if text:
+                        parts.append(text)
+            else:
+                body = container_body.strip()
+                if body:
+                    parts.append(body)
+            rendered_map[cur.node_id] = parts
+            continue
+
+        # Push exit marker, then children (reversed so first child processed first)
+        stack.append((cur, True))
+        cur_children = [c for c in children_by_parent.get(cur.node_id, []) if c.kind != "item"]
+        for child in reversed(cur_children):
+            stack.append((child, False))
+
+    return "\n\n".join(rendered_map.get(node.node_id, [])).strip()
+
+
+def _canonical_text_from_doc_nodes(
+    root: Path,
+    doc: DocRow,
+    nodes: Sequence[NodeRow],
+    *,
+    include_inactive: bool,
+) -> str:
+    doc_nodes = _sort_nodes(
+        [
+            node
+            for node in nodes
+            if node.doc_id == doc.doc_id
+            and node.source_version == doc.source_version
+            and (include_inactive or node.is_active)
+        ]
+    )
+    if not doc_nodes:
+        return normalize_canonical_text("")
+
+    children_by_parent: Dict[str, List[NodeRow]] = {}
+    top_level: List[NodeRow] = []
+    for node in doc_nodes:
+        if node.parent_id:
+            children_by_parent.setdefault(node.parent_id, []).append(node)
+        else:
+            top_level.append(node)
+    for parent_id, siblings in children_by_parent.items():
+        children_by_parent[parent_id] = _sort_nodes(siblings)
+
+    rendered_sections: List[str] = []
+    for node in _sort_nodes(top_level):
+        if node.kind == "item":
+            continue
+        rendered = _render_canonical_node(root, node, children_by_parent=children_by_parent).strip()
+        if rendered:
+            rendered_sections.append(rendered)
+    return normalize_canonical_text("\n\n".join(rendered_sections))
+
+
+def _load_existing_canonical_text(root: Path, row: Dict[str, object]) -> str | None:
+    rel_path = str(row.get("canonical_text_path") or "").strip()
+    if not rel_path:
+        return None
+    return _load_canonical_text_from_rel_path(root, rel_path)
+
+
+def _load_canonical_text_from_rel_path(root: Path, rel_path: str) -> str | None:
+    if not rel_path:
+        return None
+    path = root / rel_path
+    if not path.exists():
+        return None
+    return normalize_canonical_text(path.read_text(encoding="utf-8"))
+
+
+def write_corpus_manifest(root: Path, docs: Sequence[DocRow], nodes: Sequence[NodeRow]) -> Path:
+    source_paths = _load_existing_source_paths(root)
+    existing_docs = _load_existing_corpus_docs(root)
+    payload_docs = []
+    for doc in sorted(docs, key=lambda item: (item.doc_id, item.source_version, 0 if item.is_active else 1)):
+        existing_doc = existing_docs.get((doc.doc_id, doc.source_version), {})
+        if doc.is_active:
+            canonical_text = _canonical_text_from_doc_nodes(root, doc, nodes, include_inactive=False)
+        else:
+            canonical_text = _load_existing_canonical_text(root, existing_doc)
+            if canonical_text is None:
+                canonical_text = _load_canonical_text_from_rel_path(
+                    root, canonical_text_rel_path(doc.doc_id, doc.source_version)
+                )
+            if canonical_text is None:
+                canonical_text = _canonical_text_from_doc_nodes(root, doc, nodes, include_inactive=True)
+        if canonical_text == normalize_canonical_text("") and existing_doc:
+            preserved = _load_existing_canonical_text(root, existing_doc)
+            if preserved is not None:
+                canonical_text = preserved
+        rel_path = canonical_text_rel_path(doc.doc_id, doc.source_version)
+        out_path = root / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(canonical_text, encoding="utf-8", newline="\n")
+        source_path = (
+            source_paths.get((doc.doc_id, doc.source_version)) or source_paths.get((doc.doc_id, "")) or doc.source_path
+        )
+        payload_docs.append(
+            {
+                "doc_id": doc.doc_id,
+                "title": doc.doc_title,
+                "source_file": doc.source_file,
+                "source_path": source_path,
+                "doc_hash": doc.doc_hash,
+                "source_version": doc.source_version,
+                "active_version": bool(doc.is_active),
+                "canonical_text_path": rel_path,
+                "canonical_text_sha256": canonical_text_sha256(canonical_text),
+            }
+        )
+
+    payload = {
+        "title": _load_existing_corpus_title(root),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "docs": payload_docs,
+    }
+    out_path = root / "corpus_manifest.json"
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    return out_path
+
+
+def write_phase_a_artifact_export(
+    root: Path,
+    docs: Sequence[DocRow],
+    nodes: Sequence[NodeRow],
+    edges: Sequence[EdgeRow],
+    aliases: Sequence[AliasRow],
+) -> Path:
+    return artifact_contract.write_phase_a_artifact_export(
+        root,
+        docs=docs,
+        nodes=nodes,
+        edges=edges,
+        aliases=aliases,
+    )
+
+
+def _stable_payload(value: object) -> str:
+    return state_contract.stable_payload(value)
+
+
+def _default_model_registry_json() -> str:
+    return json.dumps(
+        {
+            "components": {},
+            "reranker": {
+                "version": "",
+                "fallback": "rules_only",
+            },
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _iter_block_ranges(canonical_text: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    block_start: int | None = None
+    block_end = 0
+    cursor = 0
+
+    for line in canonical_text.splitlines(keepends=True):
+        line_start = cursor
+        cursor += len(line)
+        if line.strip():
+            if block_start is None:
+                block_start = line_start
+            block_end = cursor
+            continue
+        if block_start is not None:
+            ranges.append((block_start, block_end))
+            block_start = None
+
+    if block_start is not None:
+        ranges.append((block_start, block_end))
+    return ranges
+
+
+# NOTE: The fingerprint functions below (_span_fingerprints, _node_fingerprint,
+# _alias_fingerprint, _edge_fingerprint) are duplicated in:
+#   pack-builder/scripts/build_skill_lib/fingerprint_utils.py
+# This file is a runtime template and must remain self-contained, so we do not
+# import from the build-time module. Keep both implementations in sync manually.
+
+
+def _span_fingerprints(doc_id: str, canonical_text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for start, end in _iter_block_ranges(canonical_text):
+        span_id = _sha256_text(_stable_payload([doc_id, start, end]))[:16]
+        out[span_id] = _sha256_text(canonical_text[start:end])
+    return out
+
+
+def _node_fingerprint(node: NodeRow) -> str:
+    return _sha256_text(
+        _stable_payload(
+            {
+                "node_id": node.node_id,
+                "kind": node.kind,
+                "label": node.label,
+                "title": node.title,
+                "parent_id": node.parent_id,
+                "prev_id": node.prev_id,
+                "next_id": node.next_id,
+                "ordinal": node.ordinal,
+                "ref_path": node.ref_path,
+                "is_leaf": node.is_leaf,
+                "aliases": list(node.aliases),
+                "raw_span_start": node.raw_span_start,
+                "raw_span_end": node.raw_span_end,
+                "node_hash": node.node_hash,
+            }
+        )
+    )
+
+
+def _alias_fingerprint(alias: AliasRow) -> str:
+    return _sha256_text(
+        _stable_payload(
+            {
+                "normalized_alias": alias.normalized_alias,
+                "target_node_id": alias.target_node_id,
+                "alias_level": alias.alias_level,
+                "confidence": alias.confidence,
+                "source": alias.source,
+            }
+        )
+    )
+
+
+def _edge_fingerprint(edge: EdgeRow) -> str:
+    return _sha256_text(
+        _stable_payload(
+            {
+                "edge_type": edge.edge_type,
+                "from_node_id": edge.from_node_id,
+                "to_node_id": edge.to_node_id,
+                "confidence": edge.confidence,
+            }
+        )
+    )
+
+
+def _infer_active_parser(nodes: Sequence[NodeRow]) -> str:
+    kinds = {node.kind for node in nodes if node.is_active}
+    if {"clause", "table", "figure"} & kinds:
+        return "outline"
+    if "chapter" in kinds or "section" in kinds:
+        return "markdown_headings"
+    if "block" in kinds:
+        return "block_fallback"
+    return ""
+
+
+def _index_binding_payload(name: str, rows: Sequence[object]) -> dict[str, str]:
+    return state_contract.index_binding_payload(name, rows)
+
+
+def _export_sha_by_doc(root: Path) -> dict[tuple[str, str], str]:
+    return state_contract.export_sha_by_doc(_read_json(root / PHASE_A_ARTIFACT_EXPORT))
+
+
+def write_build_state(
+    root: Path,
+    docs: Sequence[DocRow],
+    nodes: Sequence[NodeRow],
+    edges: Sequence[EdgeRow],
+    aliases: Sequence[AliasRow],
+) -> Path:
+    manifest_rows = _load_existing_corpus_docs(root)
+    previous_state = _read_json(root / "build_state.json")
+    previous_documents = previous_state.get("documents")
+    if not isinstance(previous_documents, dict):
+        previous_documents = {}
+    export_sha_by_doc = _export_sha_by_doc(root)
+    manifest_path = root / "corpus_manifest.json"
+    state = state_contract.empty_build_state()
+    state["artifact_version"] = ARTIFACT_VERSION
+    state["created_at"] = datetime.now(timezone.utc).isoformat()
+    state["corpus_manifest_sha256"] = (
+        _sha256_text(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else ""
+    )
+    state["documents"] = {}
+    state["indexes"] = {}
+    state["model_registry_sha256"] = _sha256_text(_default_model_registry_json())
+
+    for doc in sorted((row for row in docs if row.is_active), key=lambda item: (item.doc_id, item.source_version)):
+        key = (doc.doc_id, doc.source_version)
+        manifest_row = manifest_rows.get(key, {})
+        previous_doc = previous_documents.get(doc.doc_id)
+        if not isinstance(previous_doc, dict):
+            previous_doc = {}
+        canonical_text = _load_existing_canonical_text(root, manifest_row) or ""
+        doc_nodes = [
+            node
+            for node in nodes
+            if node.doc_id == doc.doc_id and node.source_version == doc.source_version and node.is_active
+        ]
+        doc_aliases = [
+            alias
+            for alias in aliases
+            if alias.doc_id == doc.doc_id and alias.source_version == doc.source_version and alias.is_active
+        ]
+        doc_edges = [
+            edge
+            for edge in edges
+            if edge.doc_id == doc.doc_id and edge.source_version == doc.source_version and edge.is_active
+        ]
+        source_path_value = str(manifest_row.get("source_path") or previous_doc.get("source_path") or doc.source_path)
+        source_path = Path(source_path_value)
+        try:
+            source_fingerprint = _sha256_bytes(source_path.read_bytes())
+        except OSError:
+            source_fingerprint = str(previous_doc.get("source_fingerprint") or "") or _sha256_text(doc.doc_hash)
+        state["documents"][doc.doc_id] = {
+            "source_path": source_path_value,
+            "source_fingerprint": source_fingerprint,
+            "extracted_text_fingerprint": _sha256_text(canonical_text),
+            "span_fingerprints": _span_fingerprints(doc.doc_id, canonical_text),
+            "node_fingerprints": {node.node_id: _node_fingerprint(node) for node in doc_nodes},
+            "alias_fingerprints": {
+                f"{alias.normalized_alias}|{alias.target_node_id}|{alias.alias_level}": _alias_fingerprint(alias)
+                for alias in doc_aliases
+            },
+            "edge_fingerprints": {
+                f"{edge.edge_type}|{edge.from_node_id}|{edge.to_node_id}": _edge_fingerprint(edge) for edge in doc_edges
+            },
+            "active_parser": str(doc.active_parser or "") or _infer_active_parser(doc_nodes),
+            "export_sha256": export_sha_by_doc.get(key, ""),
+        }
+
+    active_node_rows = [
+        {
+            "doc_id": node.doc_id,
+            "source_version": node.source_version,
+            "node_id": node.node_id,
+            "node_hash": node.node_hash,
+            "is_leaf": node.is_leaf,
+        }
+        for node in nodes
+        if node.is_active
+    ]
+    active_leaf_rows = [
+        {
+            "doc_id": node.doc_id,
+            "source_version": node.source_version,
+            "node_id": node.node_id,
+            "node_hash": node.node_hash,
+        }
+        for node in nodes
+        if node.is_active and node.is_leaf
+    ]
+    active_alias_rows = [
+        {
+            "doc_id": alias.doc_id,
+            "source_version": alias.source_version,
+            "normalized_alias": alias.normalized_alias,
+            "target_node_id": alias.target_node_id,
+            "alias_level": alias.alias_level,
+        }
+        for alias in aliases
+        if alias.is_active
+    ]
+    active_edge_rows = [
+        {
+            "doc_id": edge.doc_id,
+            "source_version": edge.source_version,
+            "edge_type": edge.edge_type,
+            "from_node_id": edge.from_node_id,
+            "to_node_id": edge.to_node_id,
+        }
+        for edge in edges
+        if edge.is_active
+    ]
+    state["indexes"] = {
+        "sqlite": _index_binding_payload("sqlite", active_node_rows),
+        "fts": _index_binding_payload("fts", active_leaf_rows),
+        "aliases": _index_binding_payload("aliases", active_alias_rows),
+        "edges": _index_binding_payload("edges", active_edge_rows),
+    }
+
+    out_path = root / BUILD_STATE_FILENAME
+    out_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
+    )
+    return out_path
+
+
 def write_kb_sqlite_db(
     db_path: Path,
     docs: Sequence[DocRow],
@@ -457,8 +1109,7 @@ def write_kb_sqlite_db(
         db_path.unlink()
     conn = sqlite3.connect(str(db_path))
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
+        enable_wal(conn)
         conn.execute("PRAGMA temp_store = MEMORY")
 
         conn.executescript(
@@ -525,109 +1176,85 @@ def write_kb_sqlite_db(
               node_key TEXT PRIMARY KEY,
               body_md TEXT NOT NULL,
               body_plain TEXT NOT NULL,
+              keywords TEXT NOT NULL DEFAULT '',
               FOREIGN KEY (node_key) REFERENCES nodes(node_key)
             );
             """
         )
 
-        for d in docs:
-            conn.execute(
-                """
-                INSERT INTO docs(
-                  doc_id, doc_title, source_file, source_path, doc_hash, source_version, is_active
-                ) VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    d.doc_id,
-                    d.doc_title,
-                    d.source_file,
-                    d.source_path,
-                    d.doc_hash,
-                    d.source_version,
-                    1 if d.is_active else 0,
-                ),
-            )
+        doc_rows = [
+            (d.doc_id, d.doc_title, d.source_file, d.source_path,
+             d.doc_hash, d.source_version, 1 if d.is_active else 0)
+            for d in docs
+        ]
+        conn.executemany(
+            "INSERT INTO docs(doc_id, doc_title, source_file, source_path, doc_hash, source_version, is_active)"
+            " VALUES (?,?,?,?,?,?,?)",
+            doc_rows,
+        )
 
-        for n in nodes:
-            conn.execute(
-                """
-                INSERT INTO nodes(
-                  node_key, node_id, doc_id, source_version, is_active, kind, label, title, parent_id, prev_id, next_id,
-                  ordinal, ref_path, is_leaf, raw_span_start, raw_span_end, node_hash, confidence
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    n.node_key,
-                    n.node_id,
-                    n.doc_id,
-                    n.source_version,
-                    1 if n.is_active else 0,
-                    n.kind,
-                    n.label,
-                    n.title,
-                    n.parent_id,
-                    n.prev_id,
-                    n.next_id,
-                    n.ordinal,
-                    n.ref_path,
-                    1 if n.is_leaf else 0,
-                    n.raw_span_start,
-                    n.raw_span_end,
-                    n.node_hash,
-                    n.confidence,
-                ),
-            )
-            conn.execute(
-                "INSERT INTO node_text(node_key, body_md, body_plain) VALUES (?,?,?)",
-                (n.node_key, n.body_md, n.body_plain),
-            )
+        node_rows = [
+            (n.node_key, n.node_id, n.doc_id, n.source_version,
+             1 if n.is_active else 0, n.kind, n.label, n.title,
+             n.parent_id, n.prev_id, n.next_id, n.ordinal,
+             n.ref_path, 1 if n.is_leaf else 0,
+             n.raw_span_start, n.raw_span_end, n.node_hash, n.confidence)
+            for n in nodes
+        ]
+        conn.executemany(
+            "INSERT INTO nodes("
+            "  node_key, node_id, doc_id, source_version, is_active, kind, label, title,"
+            "  parent_id, prev_id, next_id, ordinal, ref_path, is_leaf,"
+            "  raw_span_start, raw_span_end, node_hash, confidence"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            node_rows,
+        )
+        node_text_rows = [
+            (n.node_key, n.body_md, n.body_plain,
+             " ".join(extract_keywords(n.body_plain, top_k=12)))
+            for n in nodes
+        ]
+        conn.executemany(
+            "INSERT INTO node_text(node_key, body_md, body_plain, keywords) VALUES (?,?,?,?)",
+            node_text_rows,
+        )
 
-        for e in edges:
-            conn.execute(
-                """
-                INSERT INTO edges(doc_id, edge_type, from_node_id, to_node_id, source_version, is_active, confidence)
-                VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    e.doc_id,
-                    e.edge_type,
-                    e.from_node_id,
-                    e.to_node_id,
-                    e.source_version,
-                    1 if e.is_active else 0,
-                    e.confidence,
-                ),
-            )
+        edge_rows = [
+            (e.doc_id, e.edge_type, e.from_node_id, e.to_node_id,
+             e.source_version, 1 if e.is_active else 0, e.confidence)
+            for e in edges
+        ]
+        conn.executemany(
+            "INSERT INTO edges(doc_id, edge_type, from_node_id, to_node_id, source_version, is_active, confidence)"
+            " VALUES (?,?,?,?,?,?,?)",
+            edge_rows,
+        )
 
-        for a in aliases:
-            conn.execute(
-                """
-                INSERT INTO aliases(doc_id, alias, normalized_alias, target_node_id, alias_level, source_version, is_active, confidence, source)
-                VALUES (?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    a.doc_id,
-                    a.alias,
-                    a.normalized_alias,
-                    a.target_node_id,
-                    a.alias_level,
-                    a.source_version,
-                    1 if a.is_active else 0,
-                    a.confidence,
-                    a.source,
-                ),
-            )
+        alias_rows = [
+            (a.doc_id, a.alias, a.normalized_alias, a.target_node_id,
+             a.alias_level, a.source_version, 1 if a.is_active else 0,
+             a.confidence, a.source)
+            for a in aliases
+        ]
+        conn.executemany(
+            "INSERT INTO aliases(doc_id, alias, normalized_alias, target_node_id, alias_level, source_version, is_active, confidence, source)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            alias_rows,
+        )
 
         try:
             conn.execute("CREATE VIRTUAL TABLE node_fts USING fts5(node_key UNINDEXED, tokens)")
         except sqlite3.OperationalError as exc:
             die(f"SQLite FTS5 is required but unavailable: {exc}")
 
-        for n in nodes:
-            if not n.is_leaf:
-                continue
-            tokens = " ".join(fts_tokens(n.title + "\n" + n.body_plain))
-            conn.execute("INSERT INTO node_fts(node_key, tokens) VALUES (?,?)", (n.node_key, tokens))
+        fts_rows = [
+            (n.node_key, " ".join(fts_tokens(n.title + "\n" + n.body_plain)))
+            for n in nodes if n.is_leaf
+        ]
+        conn.executemany(
+            "INSERT INTO node_fts(node_key, tokens) VALUES (?,?)",
+            fts_rows,
+        )
 
         conn.execute("CREATE INDEX idx_nodes_doc_id_active ON nodes(doc_id, is_active)")
         conn.execute("CREATE INDEX idx_nodes_node_id_active ON nodes(node_id, is_active)")
@@ -646,14 +1273,16 @@ def write_kb_sqlite_db(
 def read_existing_docs(db_path: Path) -> List[DocRow]:
     if not db_path.exists():
         return []
-    conn = sqlite3.connect(str(db_path))
+    from .safe_sqlite import open_db_wal, sqlite3_retry_exec
+    conn = open_db_wal(db_path)
     try:
-        rows = conn.execute(
+        rows = sqlite3_retry_exec(
+            conn,
             """
             SELECT doc_id, doc_title, source_file, source_path, doc_hash, source_version, is_active
             FROM docs
             ORDER BY doc_id, source_version DESC
-            """
+            """,
         ).fetchall()
     finally:
         conn.close()
@@ -676,10 +1305,11 @@ def read_existing_docs(db_path: Path) -> List[DocRow]:
 def read_existing_nodes(db_path: Path) -> List[NodeRow]:
     if not db_path.exists():
         return []
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    from .safe_sqlite import open_db_wal, sqlite3_retry_exec
+    conn = open_db_wal(db_path)
     try:
-        rows = conn.execute(
+        rows = sqlite3_retry_exec(
+            conn,
             """
             SELECT
               n.node_id, n.doc_id, n.kind, n.label, n.title, n.parent_id, n.prev_id, n.next_id, n.ordinal,
@@ -688,7 +1318,7 @@ def read_existing_nodes(db_path: Path) -> List[NodeRow]:
             FROM nodes n
             JOIN node_text t ON t.node_key = n.node_key
             ORDER BY n.doc_id, n.source_version DESC, n.node_id
-            """
+            """,
         ).fetchall()
     finally:
         conn.close()
@@ -723,14 +1353,16 @@ def read_existing_nodes(db_path: Path) -> List[NodeRow]:
 def read_existing_edges(db_path: Path) -> List[EdgeRow]:
     if not db_path.exists():
         return []
-    conn = sqlite3.connect(str(db_path))
+    from .safe_sqlite import open_db_wal, sqlite3_retry_exec
+    conn = open_db_wal(db_path)
     try:
-        rows = conn.execute(
+        rows = sqlite3_retry_exec(
+            conn,
             """
             SELECT doc_id, edge_type, from_node_id, to_node_id, source_version, is_active, confidence
             FROM edges
             ORDER BY doc_id, source_version DESC, edge_type, from_node_id, to_node_id
-            """
+            """,
         ).fetchall()
     finally:
         conn.close()
@@ -753,17 +1385,18 @@ def read_existing_edges(db_path: Path) -> List[EdgeRow]:
 def read_existing_aliases(db_path: Path) -> List[AliasRow]:
     if not db_path.exists():
         return []
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    from .safe_sqlite import open_db_wal, sqlite3_retry_exec
+    conn = open_db_wal(db_path)
     try:
-        rows = conn.execute(
+        rows = sqlite3_retry_exec(
+            conn,
             """
             SELECT
               doc_id, alias, normalized_alias, target_node_id, alias_level, confidence,
               source, source_version, is_active
             FROM aliases
             ORDER BY doc_id, source_version DESC, normalized_alias, target_node_id, alias_level
-            """
+            """,
         ).fetchall()
     finally:
         conn.close()
@@ -817,12 +1450,31 @@ def validate_shadow_db(db_path: Path) -> Tuple[int, int, int]:
 
 
 def atomic_replace(src: Path, dst: Path) -> None:
-    src.replace(dst)
+    """Atomically replace *dst* with *src* using os.replace (same-fs atomic).
+
+    Also handles WAL sidecars (.sqlite-wal, .sqlite-shm) atomically.
+    """
+    # os.replace is POSIX-atomic on the same filesystem.
+    os.replace(str(src), str(dst))
+    # Move WAL sidecars if present
+    for suffix in ("-wal", "-shm"):
+        src_sidecar = src.with_suffix(src.suffix + suffix)
+        dst_sidecar = dst.with_suffix(dst.suffix + suffix)
+        if src_sidecar.exists():
+            os.replace(str(src_sidecar), str(dst_sidecar))
+        elif dst_sidecar.exists() and not src_sidecar.exists():
+            # Source rebuild did not generate sidecars; old ones are stale.
+            try:
+                dst_sidecar.unlink()
+            except OSError:
+                pass
 
 
-def rebuild_shadow_db(root: Path, db_path: Path) -> Tuple[Path, List[DocRow], List[NodeRow]]:
+def rebuild_shadow_db(
+    root: Path, db_path: Path
+) -> Tuple[Path, List[DocRow], List[NodeRow], List[EdgeRow], List[AliasRow]]:
     shadow_path = db_path.with_suffix(db_path.suffix + ".next")
-    print("[OK] shadow rebuild:", shadow_path)
+    logger.info("shadow rebuild: %s", shadow_path)
     if shadow_path.exists():
         shadow_path.unlink()
 
@@ -863,7 +1515,12 @@ def rebuild_shadow_db(root: Path, db_path: Path) -> Tuple[Path, List[DocRow], Li
     merged_aliases = merge_history(
         current_aliases,
         rebuilt_aliases,
-        key_fn=lambda record: (record.normalized_alias, record.target_node_id, record.alias_level, record.source_version),
+        key_fn=lambda record: (
+            record.normalized_alias,
+            record.target_node_id,
+            record.alias_level,
+            record.source_version,
+        ),
         sort_key=lambda record: (
             record.doc_id,
             record.source_version,
@@ -876,17 +1533,41 @@ def rebuild_shadow_db(root: Path, db_path: Path) -> Tuple[Path, List[DocRow], Li
     write_kb_sqlite_db(shadow_path, merged_docs, merged_nodes, merged_edges, merged_aliases)
     docs_count, nodes_count, leaf_count = validate_shadow_db(shadow_path)
     atomic_replace(shadow_path, db_path)
-    print(f"[OK] atomic switch: {db_path} (docs={docs_count} nodes={nodes_count} leaf={leaf_count})")
-    return db_path, merged_docs, merged_nodes
+    logger.info("atomic switch: %s (docs=%s nodes=%s leaf=%s)", db_path, docs_count, nodes_count, leaf_count)
+    return db_path, merged_docs, merged_nodes, merged_edges, merged_aliases
 
 
 def cmd_reindex(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
-    db_path = root / args.db
+    db_path = resolve_db_path(root, str(getattr(args, "db", "kb.sqlite") or "kb.sqlite"))
     if not db_path.exists():
         die("Missing kb.sqlite. Rebuild the skill first.")
-    dst, docs, nodes = rebuild_shadow_db(root, db_path)
+    previous_state = {}
+    state_path = root / BUILD_STATE_FILENAME
+    if state_path.exists():
+        try:
+            previous_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            previous_state = {}
+    dst, docs, nodes, edges, aliases = rebuild_shadow_db(root, db_path)
+    write_corpus_manifest(root, docs, nodes)
+    write_phase_a_artifact_export(root, docs, nodes, edges, aliases)
+    write_build_state(root, docs, nodes, edges, aliases)
+    current_state = {}
+    if state_path.exists():
+        try:
+            current_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            current_state = {}
+    refresh = _summarize_incremental_refresh(previous_state, current_state)
     leaf = sum(1 for n in nodes if n.is_active and n.is_leaf)
-    print("[OK] Reindexed:", dst)
-    print(f"[OK] docs={len(docs)} nodes={len(nodes)} leaf={leaf}")
+    logger.info("Reindexed: %s", dst)
+    logger.info("docs=%s nodes=%s leaf=%s", len(docs), len(nodes), leaf)
+    logger.info(
+        "incremental refresh: dirty_docs=%s rewritten_rows=%s full_rewrite_rows=%s indexes=%s",
+        len(refresh.dirty_doc_ids),
+        refresh.rewritten_rows,
+        refresh.full_rewrite_rows,
+        ",".join(refresh.refreshed_indexes),
+    )
     return 0
